@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 final class CodexAppServerClient: @unchecked Sendable {
     private struct SendableParameters: @unchecked Sendable {
@@ -12,6 +13,7 @@ final class CodexAppServerClient: @unchecked Sendable {
     private var buffer = Data()
     private var nextID = 1
     private var pending: [Int: CheckedContinuation<Data, Error>] = [:]
+    private let desktopIPC = CodexDesktopIPCClient()
 
     func start() throws {
         guard process == nil else { return }
@@ -77,11 +79,18 @@ final class CodexAppServerClient: @unchecked Sendable {
     func send(_ command: CodexCommand) async throws {
         try start()
         _ = try await initializeIfNeeded()
-        _ = try await request(method: "thread/resume", params: ["threadId": command.taskID])
-        _ = try await request(method: "turn/start", params: [
-            "threadId": command.taskID,
-            "input": [["type": "text", "text": command.text]]
-        ])
+        do {
+            _ = try await request(method: "thread/resume", params: ["threadId": command.taskID])
+            _ = try await request(method: "turn/start", params: [
+                "threadId": command.taskID,
+                "input": [["type": "text", "text": command.text]]
+            ])
+        } catch where Self.isActiveWriterError(error) {
+            // Codex Desktop keeps the writer lock for every task it owns, even
+            // while it is idle. Ask that existing owner to start the turn over
+            // Codex's same-user IPC channel instead of waiting on that lock.
+            try await desktopIPC.send(command)
+        }
     }
 
     func recentMessages(threadID: String, limit: Int = 6) async throws -> [CodexMessage] {
@@ -189,5 +198,207 @@ final class CodexAppServerClient: @unchecked Sendable {
         continuations.forEach { $0.resume(throwing: error) }
         process = nil
         initialized = false
+    }
+
+    private static func isActiveWriterError(_ error: Error) -> Bool {
+        error.localizedDescription.localizedCaseInsensitiveContains("already has an active writer")
+    }
+}
+
+/// Minimal client for the private, same-user coordination channel exposed by
+/// Codex Desktop. It is used only when Desktop already owns the selected task.
+private final class CodexDesktopIPCClient: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "CodexWatch.DesktopIPC")
+
+    func send(_ command: CodexCommand) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async {
+                do {
+                    try self.sendSynchronously(command)
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func sendSynchronously(_ command: CodexCommand) throws {
+        let socketPath = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".codex/ipc/ipc.sock").path
+        let descriptor = try connect(to: socketPath)
+        defer { Darwin.close(descriptor) }
+
+        let initializeID = UUID().uuidString
+        try writeRequest(
+            descriptor: descriptor,
+            requestID: initializeID,
+            sourceClientID: "initializing-client",
+            version: 0,
+            method: "initialize",
+            params: ["clientType": "codex-watch-bridge"]
+        )
+        let initialize = try readResponse(descriptor: descriptor, requestID: initializeID)
+        guard initialize["resultType"] as? String == "success",
+              let result = initialize["result"] as? [String: Any],
+              let clientID = result["clientId"] as? String else {
+            throw ipcError(from: initialize, fallback: "Codex Desktop rechazó la conexión local")
+        }
+
+        let discoveryID = UUID().uuidString
+        try writeRequest(
+            descriptor: descriptor,
+            requestID: discoveryID,
+            sourceClientID: clientID,
+            version: 1,
+            method: "thread-owner-discovery",
+            params: ["hostId": "local", "conversationId": command.taskID]
+        )
+        let discovery = try readResponse(descriptor: descriptor, requestID: discoveryID)
+        guard discovery["resultType"] as? String == "success",
+              let ownerClientID = discovery["handledByClientId"] as? String else {
+            throw ipcError(from: discovery, fallback: "Codex Desktop no encontró la tarea abierta")
+        }
+
+        let startTurnID = UUID().uuidString
+        try writeRequest(
+            descriptor: descriptor,
+            requestID: startTurnID,
+            sourceClientID: clientID,
+            targetClientID: ownerClientID,
+            version: 1,
+            method: "thread-follower-start-turn",
+            params: [
+                "conversationId": command.taskID,
+                "turnStartParams": [
+                    "input": [["type": "text", "text": command.text]]
+                ]
+            ],
+            timeoutMilliseconds: 20_000
+        )
+        let startTurn = try readResponse(descriptor: descriptor, requestID: startTurnID)
+        guard startTurn["resultType"] as? String == "success" else {
+            throw ipcError(from: startTurn, fallback: "Codex Desktop no pudo enviar la orden")
+        }
+    }
+
+    private func connect(to path: String) throws -> Int32 {
+        guard path.utf8.count < MemoryLayout.size(ofValue: sockaddr_un().sun_path) else {
+            throw makeError("La ruta IPC de Codex es demasiado larga")
+        }
+
+        let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { throw makePOSIXError("No se pudo crear la conexión IPC") }
+
+        var timeout = timeval(tv_sec: 20, tv_usec: 0)
+        setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutableBytes(of: &address.sun_path) { destination in
+            path.utf8CString.withUnsafeBytes { source in
+                destination.copyBytes(from: source)
+            }
+        }
+
+        let status = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard status == 0 else {
+            let error = makePOSIXError("No se pudo contactar con Codex Desktop")
+            Darwin.close(descriptor)
+            throw error
+        }
+        return descriptor
+    }
+
+    private func writeRequest(
+        descriptor: Int32,
+        requestID: String,
+        sourceClientID: String,
+        targetClientID: String? = nil,
+        version: Int,
+        method: String,
+        params: [String: Any],
+        timeoutMilliseconds: Int = 5_000
+    ) throws {
+        var request: [String: Any] = [
+            "type": "request",
+            "requestId": requestID,
+            "sourceClientId": sourceClientID,
+            "version": version,
+            "method": method,
+            "params": params,
+            "timeoutMs": timeoutMilliseconds
+        ]
+        if let targetClientID { request["targetClientId"] = targetClientID }
+
+        let payload = try JSONSerialization.data(withJSONObject: request)
+        guard payload.count <= Int(UInt32.max) else { throw makeError("Mensaje IPC demasiado grande") }
+        var length = UInt32(payload.count).littleEndian
+        let header = Data(bytes: &length, count: MemoryLayout<UInt32>.size)
+        try writeAll(header, descriptor: descriptor)
+        try writeAll(payload, descriptor: descriptor)
+    }
+
+    private func readResponse(descriptor: Int32, requestID: String) throws -> [String: Any] {
+        while true {
+            let header = try readExactly(MemoryLayout<UInt32>.size, descriptor: descriptor)
+            let length = header.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self).littleEndian }
+            guard length > 0, length <= 256 * 1024 * 1024 else {
+                throw makeError("Codex Desktop devolvió una respuesta IPC inválida")
+            }
+            let payload = try readExactly(Int(length), descriptor: descriptor)
+            guard let message = try JSONSerialization.jsonObject(with: payload) as? [String: Any] else {
+                throw makeError("Codex Desktop devolvió una respuesta ilegible")
+            }
+            if message["type"] as? String == "response",
+               message["requestId"] as? String == requestID {
+                return message
+            }
+        }
+    }
+
+    private func writeAll(_ data: Data, descriptor: Int32) throws {
+        try data.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress else { return }
+            var written = 0
+            while written < rawBuffer.count {
+                let result = Darwin.write(descriptor, baseAddress.advanced(by: written), rawBuffer.count - written)
+                guard result > 0 else { throw makePOSIXError("Se cortó el envío a Codex Desktop") }
+                written += result
+            }
+        }
+    }
+
+    private func readExactly(_ count: Int, descriptor: Int32) throws -> Data {
+        var data = Data(count: count)
+        let received = try data.withUnsafeMutableBytes { rawBuffer -> Int in
+            guard let baseAddress = rawBuffer.baseAddress else { return 0 }
+            var offset = 0
+            while offset < count {
+                let result = Darwin.read(descriptor, baseAddress.advanced(by: offset), count - offset)
+                guard result > 0 else { throw makePOSIXError("Se cortó la respuesta de Codex Desktop") }
+                offset += result
+            }
+            return offset
+        }
+        guard received == count else { throw makeError("Respuesta IPC incompleta") }
+        return data
+    }
+
+    private func ipcError(from response: [String: Any], fallback: String) -> Error {
+        makeError((response["error"] as? String).map { "\(fallback): \($0)" } ?? fallback)
+    }
+
+    private func makePOSIXError(_ prefix: String) -> Error {
+        makeError("\(prefix): \(String(cString: strerror(errno)))")
+    }
+
+    private func makeError(_ message: String) -> Error {
+        NSError(domain: "CodexDesktopIPC", code: Int(errno), userInfo: [NSLocalizedDescriptionKey: message])
     }
 }

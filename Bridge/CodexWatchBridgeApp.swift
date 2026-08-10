@@ -118,7 +118,6 @@ final class BridgeController: ObservableObject {
     private var isCodexReady = false
     private var authenticationLimiter = AuthenticationRateLimiter()
     private var commandReceipts: [UUID: CommandReceipt] = [:]
-    private var pendingDeliveryTasks: [UUID: Task<Void, Never>] = [:]
 
     private struct PendingDelivery {
         let command: CodexCommand
@@ -255,7 +254,7 @@ final class BridgeController: ObservableObject {
             do {
                 let command = try CodexWatchWire.decode(CodexCommand.self, from: request.body)
                 if let existing = commandReceipts[command.id] { return .encodable(existing) }
-                let receipt = await deliverOrQueue(
+                let receipt = await deliver(
                     PendingDelivery(command: command, successMessage: "Orden enviada")
                 )
                 return .encodable(receipt)
@@ -314,7 +313,7 @@ final class BridgeController: ObservableObject {
                 model: voiceCommand.transcriptionModel,
                 apiKey: apiKey
             )
-            let receipt = await deliverOrQueue(
+            let receipt = await deliver(
                 PendingDelivery(
                     command: CodexCommand(voiceCommand: voiceCommand, text: transcript),
                     successMessage: "Orden transcrita y enviada"
@@ -332,7 +331,7 @@ final class BridgeController: ObservableObject {
         }
     }
 
-    private func deliverOrQueue(_ delivery: PendingDelivery) async -> CommandReceipt {
+    private func deliver(_ delivery: PendingDelivery) async -> CommandReceipt {
         do {
             try await appServer.send(delivery.command)
             let receipt = CommandReceipt(
@@ -341,15 +340,6 @@ final class BridgeController: ObservableObject {
                 message: delivery.successMessage
             )
             remember(receipt)
-            return receipt
-        } catch where Self.isActiveWriterError(error) {
-            let receipt = CommandReceipt(
-                commandID: delivery.command.id,
-                state: .queued,
-                message: "Codex está trabajando; orden en cola"
-            )
-            remember(receipt)
-            scheduleRetry(delivery)
             return receipt
         } catch {
             let receipt = CommandReceipt(
@@ -360,54 +350,6 @@ final class BridgeController: ObservableObject {
             remember(receipt)
             return receipt
         }
-    }
-
-    private func scheduleRetry(_ delivery: PendingDelivery) {
-        guard pendingDeliveryTasks[delivery.command.id] == nil else { return }
-        pendingDeliveryTasks[delivery.command.id] = Task { [weak self] in
-            guard let self else { return }
-            await retry(delivery)
-        }
-    }
-
-    private func retry(_ delivery: PendingDelivery) async {
-        defer { pendingDeliveryTasks[delivery.command.id] = nil }
-        // Keep the already-transcribed order in memory for up to 30 minutes.
-        // This covers long Codex turns without billing for transcription twice.
-        for _ in 0..<600 {
-            do {
-                try await Task.sleep(for: .seconds(3))
-            } catch {
-                return
-            }
-            do {
-                try await appServer.send(delivery.command)
-                remember(CommandReceipt(
-                    commandID: delivery.command.id,
-                    state: .sent,
-                    message: delivery.successMessage
-                ))
-                return
-            } catch where Self.isActiveWriterError(error) {
-                continue
-            } catch {
-                remember(CommandReceipt(
-                    commandID: delivery.command.id,
-                    state: .failed,
-                    message: error.localizedDescription
-                ))
-                return
-            }
-        }
-        remember(CommandReceipt(
-            commandID: delivery.command.id,
-            state: .failed,
-            message: "Codex siguió ocupado durante 30 minutos"
-        ))
-    }
-
-    private static func isActiveWriterError(_ error: Error) -> Bool {
-        error.localizedDescription.localizedCaseInsensitiveContains("already has an active writer")
     }
 
     private func remember(_ receipt: CommandReceipt) {

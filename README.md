@@ -23,7 +23,7 @@ La app compañera ofrece dos rutas:
 
 El Companion permite seleccionar cualquiera de los seis modelos de transcripción de ficheros admitidos: `gpt-transcribe`, `gpt-4o-transcribe`, `gpt-4o-mini-transcribe`, `gpt-4o-mini-transcribe-2025-12-15`, `gpt-4o-transcribe-diarize` y `whisper-1`. La API key se configura en Codex Watch Bridge y se guarda únicamente en el llavero del Mac.
 
-Si la tarea seleccionada ya tiene un turno activo en la aplicación de Codex, el bridge conserva la orden transcrita y la reintenta automáticamente cuando se libera el escritor. El Watch muestra el estado en cola y recibe la confirmación final sin repetir la transcripción ni su facturación.
+Si Codex Desktop ya es propietario de la tarea seleccionada, el bridge entrega la orden al proceso propietario mediante el canal IPC local y privado de Codex. Así evita crear un segundo escritor, no repite la transcripción ni su facturación y devuelve al Watch una confirmación final en vez de dejar la orden indefinidamente en cola.
 
 ## Fuera de casa
 
