@@ -148,6 +148,7 @@ enum CodexWatchWire {
     static let tasksError = "codexwatch.tasks.error"
     static let command = "codexwatch.command"
     static let commandReceipt = "codexwatch.command.receipt"
+    static let commandReceiptRequest = "codexwatch.command.receipt.request"
     static let voiceCommand = "codexwatch.voice.command"
     static let voiceInputMode = "codexwatch.voice.input-mode"
     static let transcriptionModel = "codexwatch.transcription.model"

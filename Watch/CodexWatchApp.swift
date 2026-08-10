@@ -172,6 +172,19 @@ struct VoiceCommandView: View {
       }
     }
     .task { relay.loadConversation(for: task.id) }
+    .task(id: commandID) {
+      guard let commandID else { return }
+      while !Task.isCancelled,
+        relay.commandReceipts[commandID]?.state == .queued
+      {
+        relay.refreshReceipt(commandID)
+        do {
+          try await Task.sleep(for: .seconds(3))
+        } catch {
+          return
+        }
+      }
+    }
     .onDisappear { recorder.discard() }
     .onChange(of: receipt?.state) { _, state in
       guard state == .sent else { return }
@@ -476,6 +489,16 @@ final class WatchRelay: NSObject, ObservableObject {
     return command.id
   }
 
+  func refreshReceipt(_ commandID: UUID) {
+    guard let session, session.activationState == .activated, session.isReachable else { return }
+    let replyHandler = WatchReceiptReplyHandler(commandID: commandID)
+    session.sendMessage(
+      [CodexWatchWire.commandReceiptRequest: commandID.uuidString],
+      replyHandler: replyHandler.receive,
+      errorHandler: replyHandler.fail
+    )
+  }
+
   func refreshTasks() {
     guard !isRefreshingTasks else { return }
     guard let session, session.activationState == .activated else {
@@ -656,6 +679,23 @@ private final class WatchTasksReplyHandler: @unchecked Sendable {
 
   func fail(_ error: Error) {
     Task { @MainActor in WatchRelay.shared.failTaskRefresh("iPhone no disponible") }
+  }
+}
+
+private final class WatchReceiptReplyHandler: @unchecked Sendable {
+  private let commandID: UUID
+
+  init(commandID: UUID) {
+    self.commandID = commandID
+  }
+
+  func receive(_ reply: [String: Any]) {
+    guard let data = reply[CodexWatchWire.commandReceipt] as? Data else { return }
+    Task { @MainActor in WatchRelay.shared.applyCommandReceipt(data) }
+  }
+
+  func fail(_ error: Error) {
+    // A later poll will retry when the iPhone is reachable again.
   }
 }
 

@@ -1,6 +1,7 @@
 import SwiftUI
 import WatchConnectivity
 import Foundation
+import UIKit
 
 enum MacConnectionMethod: String, CaseIterable, Identifiable {
     case zeroTierVPN
@@ -457,7 +458,11 @@ final class PhoneRelay: NSObject, ObservableObject {
         if session.isReachable {
             session.sendMessage([CodexWatchWire.commandReceipt: data], replyHandler: nil)
         }
-        session.transferUserInfo([CodexWatchWire.commandReceipt: data])
+        // Queued updates are transient and can overtake a later terminal update
+        // when transferUserInfo deliveries are delayed. Persist only final states.
+        if receipt.state != .queued {
+            session.transferUserInfo([CodexWatchWire.commandReceipt: data])
+        }
     }
 
     private func monitorReceiptIfNeeded(_ receipt: CommandReceipt, taskTitle: String) {
@@ -530,6 +535,34 @@ extension PhoneRelay: WCSessionDelegate {
             receiveCommand(commandData, reply: reply)
             return
         }
+        if let rawCommandID = message[CodexWatchWire.commandReceiptRequest] as? String,
+           let commandID = UUID(uuidString: rawCommandID) {
+            Task { @MainActor [weak self] in
+                guard let self,
+                      let baseURL = activeBridgeURL ?? configuredBridgeURL else {
+                    reply.call([:])
+                    return
+                }
+                let backgroundTask = UIApplication.shared.beginBackgroundTask(
+                    withName: "CodexWatch receipt lookup",
+                    expirationHandler: nil
+                )
+                defer {
+                    if backgroundTask != .invalid {
+                        UIApplication.shared.endBackgroundTask(backgroundTask)
+                    }
+                }
+                do {
+                    let receipt = try await MacBridgeClient(baseURL: baseURL, token: accessToken)
+                        .fetchReceipt(commandID: commandID)
+                    let data = try CodexWatchWire.encode(receipt)
+                    reply.call([CodexWatchWire.commandReceipt: data])
+                } catch {
+                    reply.call([:])
+                }
+            }
+            return
+        }
         if message[CodexWatchWire.tasksRequest] as? Bool == true {
             Task { @MainActor [weak self] in
                 guard let self else { reply.call([:]); return }
@@ -585,6 +618,15 @@ extension PhoneRelay: WCSessionDelegate {
             return
         }
         Task { @MainActor [weak self] in
+            let backgroundTask = UIApplication.shared.beginBackgroundTask(
+                withName: "CodexWatch voice delivery",
+                expirationHandler: nil
+            )
+            defer {
+                if backgroundTask != .invalid {
+                    UIApplication.shared.endBackgroundTask(backgroundTask)
+                }
+            }
             await self?.submitVoice(command, audioURL: copiedURL)
         }
     }
