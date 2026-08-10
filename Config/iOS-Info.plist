@@ -24,17 +24,11 @@
 	<true/>
 	<key>NSAppTransportSecurity</key>
 	<dict>
-		<key>NSAllowsArbitraryLoads</key>
-		<true/>
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
-	<key>NSBonjourServices</key>
-	<array>
-		<string>_codexwatch._tcp</string>
-	</array>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Codex Watch necesita encontrar el puente privado de Codex en tu Mac.</string>
+	<string>Codex Watch necesita conectar con el puente privado de Codex mediante ZeroTier.</string>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UIRequiredDeviceCapabilities</key>

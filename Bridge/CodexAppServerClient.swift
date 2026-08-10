@@ -1,6 +1,10 @@
 import Foundation
 
 final class CodexAppServerClient: @unchecked Sendable {
+    private struct SendableParameters: @unchecked Sendable {
+        let value: [String: Any]
+    }
+
     private let queue = DispatchQueue(label: "CodexWatch.AppServer")
     private let input = Pipe()
     private let output = Pipe()
@@ -30,10 +34,12 @@ final class CodexAppServerClient: @unchecked Sendable {
         output.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty else { return }
-            self?.queue.async { self?.consume(data) }
+            guard let client = self else { return }
+            client.queue.async { [weak client] in client?.consume(data) }
         }
         process.terminationHandler = { [weak self] _ in
-            self?.queue.async { self?.failAll(message: "Codex app-server se ha cerrado") }
+            guard let client = self else { return }
+            client.queue.async { [weak client] in client?.failAll(message: "Codex app-server se ha cerrado") }
         }
         try process.run()
         self.process = process
@@ -131,18 +137,19 @@ final class CodexAppServerClient: @unchecked Sendable {
     private func initializeIfNeeded() async throws -> [String: Any] {
         if initialized { return [:] }
         let response = try await request(method: "initialize", params: [
-            "clientInfo": ["name": "codex-watch-bridge", "title": "Codex Watch Bridge", "version": "0.1.0"]
+            "clientInfo": ["name": "codex-watch-bridge", "title": "Codex Watch Bridge", "version": "0.4.0"]
         ])
         initialized = true
         return response
     }
 
     private func request(method: String, params: [String: Any]) async throws -> [String: Any] {
+        let sendableParameters = SendableParameters(value: params)
         let data: Data = try await withCheckedThrowingContinuation { continuation in
             queue.async {
                 let id = self.nextID
                 self.nextID += 1
-                let message: [String: Any] = ["method": method, "id": id, "params": params]
+                let message: [String: Any] = ["method": method, "id": id, "params": sendableParameters.value]
                 do {
                     var encoded = try JSONSerialization.data(withJSONObject: message)
                     encoded.append(0x0A)
