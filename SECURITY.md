@@ -2,18 +2,20 @@
 
 ## Modelo de exposición
 
-Codex Watch Bridge está diseñado para una red privada de ZeroTier. No debe publicarse el puerto `48720` mediante NAT, port forwarding, túneles públicos ni proxies accesibles desde Internet.
+Codex Watch Bridge está diseñado para redes privadas: VPN como ZeroTier, Tailscale o WireGuard, y una LAN de confianza. No debe publicarse el puerto HTTP `48720` mediante NAT, port forwarding ni túneles públicos.
 
-El tráfico HTTP viaja dentro del transporte cifrado de ZeroTier. La autenticación mediante token es una defensa adicional, no un sustituto de la red privada. Todos los miembros autorizados en la misma red ZeroTier deben considerarse capaces de intentar conectar con el bridge.
+En una VPN cifrada, el tráfico HTTP queda protegido por ese transporte. En una LAN, el token autentica al cliente pero el contenido HTTP no está cifrado; úsala solo si la red es de confianza. Para un dominio o una IP pública, el Companion exige HTTPS y debe colocarse un proxy TLS seguro delante del bridge. Todos los equipos de la misma red privada deben considerarse capaces de intentar conectar con él.
 
-El socket puede aparecer como listener global en herramientas del sistema porque `Network.framework` no identifica de forma estable la interfaz virtual de ZeroTier cuando el tráfico llega desde redes móviles. El bridge cancela antes de leer datos cualquier conexión cuyo origen no pertenezca al CIDR asignado por ZeroTier; después aplica el token y el rate limiting.
+El socket puede aparecer como listener global en herramientas del sistema. El bridge cancela antes de leer datos cualquier conexión cuyo origen no sea loopback, una IPv4 privada/CGNAT/link-local o el CIDR asignado por ZeroTier; después aplica el token y el rate limiting.
 
 ## Datos sensibles
 
 - El repositorio no debe contener direcciones de red reales, tokens, identificadores de red ZeroTier ni datos exportados de conversaciones.
 - El token del bridge se guarda en Keychain y puede revocarse desde la aplicación de macOS.
+- La API key de OpenAI se guarda en una entrada separada de Keychain en el Mac; nunca se envía al iPhone o al Watch ni se incluye en el repositorio.
 - La URL privada se guarda en las preferencias locales del iPhone.
-- Los mensajes y órdenes se procesan en memoria y no se persisten por la aplicación.
+- Los mensajes y órdenes de texto se procesan en memoria. Las notas de voz se guardan transitoriamente durante el transporte y la transcripción y se eliminan después de procesarlas.
+- El dictado del Apple Watch se procesa mediante el servicio elegido por watchOS. En el modo OpenAI API, el bridge envía el fichero de audio a OpenAI para su transcripción facturable.
 
 ## Reporte de vulnerabilidades
 

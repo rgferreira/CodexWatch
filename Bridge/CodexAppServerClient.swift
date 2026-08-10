@@ -53,7 +53,6 @@ final class CodexAppServerClient: @unchecked Sendable {
             "sortKey": "updated_at",
             "sortDirection": "desc",
             "archived": false,
-            "useStateDbOnly": true,
             "sourceKinds": ["appServer", "cli", "vscode"]
         ])
 

@@ -28,7 +28,7 @@
 		<true/>
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Codex Watch necesita conectar con el puente privado de Codex mediante ZeroTier.</string>
+	<string>Codex Watch necesita conectar con el puente privado de Codex mediante una VPN o la red local.</string>
 	<key>UILaunchScreen</key>
 	<dict/>
 	<key>UIRequiredDeviceCapabilities</key>

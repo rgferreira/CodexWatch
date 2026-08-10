@@ -58,7 +58,7 @@ final class LocalHTTPServer: @unchecked Sendable {
         case invalidPrivateNetwork
 
         var errorDescription: String? {
-            "La red IPv4 privada de ZeroTier no es válida."
+            "La red IPv4 privada configurada no es válida."
         }
     }
 
@@ -69,7 +69,7 @@ final class LocalHTTPServer: @unchecked Sendable {
     }
 
     private static let maximumHeaderBytes = 16 * 1024
-    private static let maximumBodyBytes = 64 * 1024
+    private static let maximumBodyBytes = 2 * 1024 * 1024
     private static let maximumRequestBytes = maximumHeaderBytes + maximumBodyBytes + 4
     private static let maximumConnections = 24
     private static let logger = Logger(subsystem: "com.rgferreira.CodexWatchBridge", category: "Network")
@@ -133,7 +133,7 @@ final class LocalHTTPServer: @unchecked Sendable {
         connections[identifier] = connection
         connection.start(queue: queue)
         receive(on: connection, identifier: identifier, accumulated: Data())
-        queue.asyncAfter(deadline: .now() + 30) { [weak self] in
+        queue.asyncAfter(deadline: .now() + 90) { [weak self] in
             self?.finish(identifier)
         }
     }
@@ -180,7 +180,18 @@ final class LocalHTTPServer: @unchecked Sendable {
     private func isAllowedPrivatePeer(_ endpoint: NWEndpoint) -> Bool {
         guard case .hostPort(let host, _) = endpoint,
               let candidate = Self.ipv4Value(String(describing: host)) else { return false }
-        return candidate & allowedMask == allowedNetwork
+        return candidate & allowedMask == allowedNetwork || Self.isPrivateOrLoopback(candidate)
+    }
+
+    private static func isPrivateOrLoopback(_ value: UInt32) -> Bool {
+        let first = UInt8((value >> 24) & 0xff)
+        let second = UInt8((value >> 16) & 0xff)
+        if first == 10 || first == 127 { return true }
+        if first == 172, (16...31).contains(second) { return true }
+        if first == 192, second == 168 { return true }
+        if first == 100, (64...127).contains(second) { return true }
+        if first == 169, second == 254 { return true }
+        return false
     }
 
     private static func ipv4Value(_ value: String) -> UInt32? {

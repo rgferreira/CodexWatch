@@ -100,11 +100,18 @@ struct VoiceCommandView: View {
   @Environment(\.dismiss) private var dismiss
   let task: CodexTask
 
+  @StateObject private var recorder = WatchVoiceRecorder()
+  @State private var commandID: UUID?
   @State private var transcript = ""
   @State private var sent = false
 
   private var recentMessages: [CodexMessage] {
     relay.conversations[task.id] ?? []
+  }
+
+  private var receipt: CommandReceipt? {
+    guard let commandID else { return nil }
+    return relay.commandReceipts[commandID]
   }
 
   var body: some View {
@@ -139,37 +146,7 @@ struct VoiceCommandView: View {
 
           Divider()
 
-          TextFieldLink(prompt: Text("Di la orden que quieres enviar a Codex")) {
-            Label(transcript.isEmpty ? "Dictar orden" : "Volver a dictar", systemImage: "mic.fill")
-          } onSubmit: {
-            transcript = $0
-          }
-          .buttonStyle(.borderedProminent)
-
-          if !transcript.isEmpty {
-            Text(transcript)
-              .font(.body)
-              .padding(8)
-              .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
-
-            Button("Enviar") {
-              relay.send(CodexCommand(task: task, text: transcript))
-              WKInterfaceDevice.current().play(.success)
-              sent = true
-            }
-            .tint(.green)
-          }
-
-          if sent {
-            Label("Enviado", systemImage: "checkmark.circle.fill")
-              .foregroundStyle(.green)
-              .onAppear {
-                Task {
-                  try? await Task.sleep(for: .seconds(1))
-                  dismiss()
-                }
-              }
-          }
+          voiceComposer
 
           Color.clear
             .frame(height: 1)
@@ -196,8 +173,132 @@ struct VoiceCommandView: View {
       }
     }
     .task { relay.loadConversation(for: task.id) }
+    .onDisappear { recorder.discard() }
+    .onChange(of: receipt?.state) { _, state in
+      guard state == .sent else { return }
+      WKInterfaceDevice.current().play(.success)
+      Task {
+        try? await Task.sleep(for: .seconds(1.2))
+        dismiss()
+      }
+    }
   }
 
+  @ViewBuilder
+  private var voiceComposer: some View {
+    if relay.voiceInputMode == .watchDictation {
+      watchDictationComposer
+    } else {
+      openAIComposer
+    }
+  }
+
+  @ViewBuilder
+  private var watchDictationComposer: some View {
+    TextFieldLink(prompt: Text("Di la orden que quieres enviar a Codex")) {
+      Label(transcript.isEmpty ? "Dictar orden" : "Volver a dictar", systemImage: "mic.fill")
+    } onSubmit: {
+      transcript = $0
+    }
+    .buttonStyle(.borderedProminent)
+
+    if !transcript.isEmpty {
+      Text(transcript)
+        .font(.body)
+        .padding(8)
+        .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+
+      Button("Enviar") {
+        relay.send(CodexCommand(task: task, text: transcript))
+        WKInterfaceDevice.current().play(.success)
+        sent = true
+      }
+      .tint(.green)
+    }
+
+    if sent {
+      Label("Enviado", systemImage: "checkmark.circle.fill")
+        .foregroundStyle(.green)
+        .onAppear {
+          Task {
+            try? await Task.sleep(for: .seconds(1))
+            dismiss()
+          }
+        }
+    }
+  }
+
+  @ViewBuilder
+  private var openAIComposer: some View {
+    switch recorder.state {
+    case .idle:
+      Button {
+        Task { await recorder.start() }
+      } label: {
+        Label("Grabar para OpenAI", systemImage: "mic.fill")
+      }
+      .buttonStyle(.borderedProminent)
+
+    case .requestingPermission:
+      HStack {
+        ProgressView()
+        Text("Preparando micrófono…")
+          .font(.caption)
+      }
+
+    case .recording:
+      Button {
+        recorder.stop()
+      } label: {
+        Label("Detener · \(formattedDuration)", systemImage: "stop.fill")
+      }
+      .buttonStyle(.borderedProminent)
+      .tint(.red)
+
+    case .ready:
+      Label("\(relay.transcriptionModel.displayName) · \(formattedDuration)", systemImage: "waveform")
+        .font(.caption)
+        .foregroundStyle(.secondary)
+      Button("Enviar nota de voz") {
+        guard let url = recorder.takeRecordingURL(),
+              let identifier = relay.sendVoice(task: task, fileURL: url) else { return }
+        commandID = identifier
+        WKInterfaceDevice.current().play(.click)
+      }
+      .tint(.green)
+      Button("Volver a grabar") { recorder.discard() }
+        .font(.caption)
+
+    case .failed(let message):
+      Label(message, systemImage: "exclamationmark.triangle")
+        .font(.caption2)
+        .foregroundStyle(.orange)
+      Button("Intentar de nuevo") { recorder.discard() }
+    }
+
+    if let receipt {
+      switch receipt.state {
+      case .queued:
+        HStack {
+          ProgressView()
+          Text(receipt.message).font(.caption2)
+        }
+      case .sent:
+        Label(receipt.message, systemImage: "checkmark.circle.fill")
+          .font(.caption)
+          .foregroundStyle(.green)
+      case .failed:
+        Label(receipt.message, systemImage: "xmark.circle.fill")
+          .font(.caption2)
+          .foregroundStyle(.red)
+      }
+    }
+  }
+
+  private var formattedDuration: String {
+    let seconds = max(0, Int(recorder.duration.rounded()))
+    return String(format: "%d:%02d", seconds / 60, seconds % 60)
+  }
 }
 
 private struct MarqueeTitle: View {
@@ -292,8 +393,12 @@ final class WatchRelay: NSObject, ObservableObject {
   @Published private(set) var conversationErrors: [String: String] = [:]
   @Published private(set) var isRefreshingTasks = false
   @Published private(set) var taskRefreshError: String?
+  @Published private(set) var commandReceipts: [UUID: CommandReceipt] = [:]
+  @Published private(set) var voiceInputMode: VoiceInputMode = .watchDictation
+  @Published private(set) var transcriptionModel: OpenAITranscriptionModel = .gptTranscribe
 
   private let session: WCSession? = WCSession.isSupported() ? .default : nil
+  private var lastQueuedTaskRequest: Date?
 
   func start() {
     guard session?.delegate == nil else { return }
@@ -302,6 +407,10 @@ final class WatchRelay: NSObject, ObservableObject {
     if let data = session?.receivedApplicationContext[CodexWatchWire.tasks] as? Data {
       applyTasks(data)
     }
+    applyVoiceSettings(
+      inputModeRawValue: session?.receivedApplicationContext[CodexWatchWire.voiceInputMode] as? String,
+      modelRawValue: session?.receivedApplicationContext[CodexWatchWire.transcriptionModel] as? String
+    )
   }
 
   func send(_ command: CodexCommand) {
@@ -315,14 +424,42 @@ final class WatchRelay: NSObject, ObservableObject {
     }
   }
 
+  func sendVoice(task: CodexTask, fileURL: URL) -> UUID? {
+    guard let session, session.activationState == .activated else {
+      try? FileManager.default.removeItem(at: fileURL)
+      return nil
+    }
+    let command = CodexVoiceCommand(task: task, transcriptionModel: transcriptionModel)
+    guard let metadata = try? CodexWatchWire.encode(command) else {
+      try? FileManager.default.removeItem(at: fileURL)
+      return nil
+    }
+    commandReceipts[command.id] = CommandReceipt(
+      commandID: command.id,
+      state: .queued,
+      message: "Enviando audio al iPhone…"
+    )
+    session.transferFile(fileURL, metadata: [CodexWatchWire.voiceCommand: metadata])
+    return command.id
+  }
+
   func refreshTasks() {
     guard !isRefreshingTasks else { return }
-    guard let session, session.activationState == .activated, session.isReachable else {
-      taskRefreshError = "iPhone no disponible"
+    guard let session, session.activationState == .activated else {
+      taskRefreshError = "Conectando con el iPhone…"
       return
     }
     isRefreshingTasks = true
     taskRefreshError = nil
+    guard session.isReachable else {
+      if lastQueuedTaskRequest.map({ Date().timeIntervalSince($0) > 45 }) ?? true {
+        lastQueuedTaskRequest = Date()
+        session.transferUserInfo([CodexWatchWire.tasksRequest: true])
+      }
+      isRefreshingTasks = false
+      taskRefreshError = "Actualización en segundo plano pendiente"
+      return
+    }
     let replyHandler = WatchTasksReplyHandler()
     session.sendMessage(
       [CodexWatchWire.tasksRequest: true],
@@ -376,6 +513,11 @@ final class WatchRelay: NSObject, ObservableObject {
     applyTasks(data)
   }
 
+  fileprivate func applyCommandReceipt(_ data: Data) {
+    guard let receipt = try? CodexWatchWire.decode(CommandReceipt.self, from: data) else { return }
+    commandReceipts[receipt.commandID] = receipt
+  }
+
   fileprivate func failTaskRefresh(_ message: String) {
     isRefreshingTasks = false
     taskRefreshError = message
@@ -384,6 +526,18 @@ final class WatchRelay: NSObject, ObservableObject {
   private func applyTasks(_ data: Data) {
     guard let decoded = try? CodexWatchWire.decode([CodexTask].self, from: data) else { return }
     tasks = decoded.sorted { $0.updatedAt > $1.updatedAt }
+    isRefreshingTasks = false
+    taskRefreshError = nil
+    lastQueuedTaskRequest = nil
+  }
+
+  private func applyVoiceSettings(inputModeRawValue: String?, modelRawValue: String?) {
+    if let inputModeRawValue, let mode = VoiceInputMode(rawValue: inputModeRawValue) {
+      voiceInputMode = mode
+    }
+    if let modelRawValue, let model = OpenAITranscriptionModel(rawValue: modelRawValue) {
+      transcriptionModel = model
+    }
   }
 }
 
@@ -399,8 +553,52 @@ extension WatchRelay: WCSessionDelegate {
   nonisolated func session(
     _ session: WCSession, didReceiveApplicationContext applicationContext: [String: Any]
   ) {
-    guard let data = applicationContext[CodexWatchWire.tasks] as? Data else { return }
-    Task { @MainActor [weak self] in self?.applyTasks(data) }
+    let tasksData = applicationContext[CodexWatchWire.tasks] as? Data
+    let inputMode = applicationContext[CodexWatchWire.voiceInputMode] as? String
+    let transcriptionModel = applicationContext[CodexWatchWire.transcriptionModel] as? String
+    Task { @MainActor [weak self] in
+      if let tasksData { self?.applyTasks(tasksData) }
+      self?.applyVoiceSettings(inputModeRawValue: inputMode, modelRawValue: transcriptionModel)
+    }
+  }
+
+  nonisolated func session(_ session: WCSession, didReceiveMessage message: [String: Any]) {
+    let tasksData = message[CodexWatchWire.tasksResponse] as? Data
+    let receiptData = message[CodexWatchWire.commandReceipt] as? Data
+    Task { @MainActor [weak self] in
+      if let tasksData { self?.applyTasks(tasksData) }
+      if let receiptData { self?.applyCommandReceipt(receiptData) }
+    }
+  }
+
+  nonisolated func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
+    guard let data = userInfo[CodexWatchWire.commandReceipt] as? Data else { return }
+    Task { @MainActor [weak self] in self?.applyCommandReceipt(data) }
+  }
+
+  nonisolated func sessionReachabilityDidChange(_ session: WCSession) {
+    guard session.isReachable else { return }
+    Task { @MainActor [weak self] in self?.refreshTasks() }
+  }
+
+  nonisolated func session(
+    _ session: WCSession,
+    didFinish fileTransfer: WCSessionFileTransfer,
+    error: Error?
+  ) {
+    let fileURL = fileTransfer.file.fileURL
+    let metadata = fileTransfer.file.metadata?[CodexWatchWire.voiceCommand] as? Data
+    Task { @MainActor [weak self] in
+      defer { try? FileManager.default.removeItem(at: fileURL) }
+      guard let error,
+            let metadata,
+            let command = try? CodexWatchWire.decode(CodexVoiceCommand.self, from: metadata) else { return }
+      self?.commandReceipts[command.id] = CommandReceipt(
+        commandID: command.id,
+        state: .failed,
+        message: "No se pudo transferir el audio: \(error.localizedDescription)"
+      )
+    }
   }
 }
 

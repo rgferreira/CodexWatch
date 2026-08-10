@@ -2,6 +2,25 @@ import SwiftUI
 import WatchConnectivity
 import Foundation
 
+enum MacConnectionMethod: String, CaseIterable, Identifiable {
+    case zeroTierVPN
+    case localNetwork
+    case secureHTTPS
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .zeroTierVPN: "ZeroTier / VPN"
+        case .localNetwork: "Red local"
+        case .secureHTTPS: "HTTPS personalizado"
+        }
+    }
+
+    var defaultPort: Int { self == .secureHTTPS ? 443 : 48720 }
+    var scheme: String { self == .secureHTTPS ? "https" : "http" }
+}
+
 @main
 struct CodexWatchMobileApp: App {
     @StateObject private var relay = PhoneRelay.shared
@@ -17,12 +36,15 @@ struct CodexWatchMobileApp: App {
 
 struct PhoneHomeView: View {
     private enum Field: Hashable {
-        case address
+        case host
+        case port
         case accessToken
     }
 
     @EnvironmentObject private var relay: PhoneRelay
-    @State private var bridgeURL = ""
+    @State private var connectionMethod: MacConnectionMethod = .zeroTierVPN
+    @State private var bridgeHost = ""
+    @State private var bridgePort = "48720"
     @State private var accessToken = ""
     @State private var connectAttempts = 0
     @FocusState private var focusedField: Field?
@@ -36,13 +58,31 @@ struct PhoneHomeView: View {
                 }
 
                 Section("Puente del Mac") {
-                    TextField("Dirección", text: $bridgeURL)
+                    Picker("Método", selection: $connectionMethod) {
+                        ForEach(MacConnectionMethod.allCases) { method in
+                            Text(method.title).tag(method)
+                        }
+                    }
+                    .onChange(of: connectionMethod) { oldValue, newValue in
+                        if bridgePort == String(oldValue.defaultPort) || bridgePort.isEmpty {
+                            bridgePort = String(newValue.defaultPort)
+                        }
+                    }
+
+                    TextField("IP o nombre del Mac", text: $bridgeHost)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .keyboardType(.URL)
                         .submitLabel(.next)
-                        .focused($focusedField, equals: .address)
-                        .onSubmit { focusedField = .accessToken }
+                        .focused($focusedField, equals: .host)
+                        .onSubmit { focusedField = .port }
+                    TextField("Puerto", text: $bridgePort)
+                        .keyboardType(.numberPad)
+                        .focused($focusedField, equals: .port)
+                        .onChange(of: bridgePort) { _, value in
+                            let sanitized = String(value.filter(\.isNumber).prefix(5))
+                            if bridgePort != sanitized { bridgePort = sanitized }
+                        }
                     SecureField("Token de acceso", text: $accessToken)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
@@ -75,8 +115,45 @@ struct PhoneHomeView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
-                    .disabled(relay.isConnecting || bridgeURL.isEmpty || accessToken.count != 43)
+                    .disabled(relay.isConnecting || bridgeHost.isEmpty || bridgePort.isEmpty || accessToken.count != 43)
                     .sensoryFeedback(.impact(weight: .medium), trigger: connectAttempts)
+
+                    Text(connectionHelp)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("Órdenes de voz") {
+                    Picker("Transcripción", selection: Binding(
+                        get: { relay.voiceInputMode },
+                        set: { relay.setVoiceInputMode($0) }
+                    )) {
+                        ForEach(VoiceInputMode.allCases) { mode in
+                            Text(mode.displayName)
+                            .tag(mode)
+                        }
+                    }
+
+                    if relay.voiceInputMode == .openAIAPI {
+                        Picker("Modelo", selection: Binding(
+                            get: { relay.transcriptionModel },
+                            set: { relay.setTranscriptionModel($0) }
+                        )) {
+                            ForEach(OpenAITranscriptionModel.allCases) { model in
+                                Text(model.displayName).tag(model)
+                            }
+                        }
+                        Text(relay.transcriptionModel.detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Label("Usa la API de OpenAI y genera facturación. La API key se guarda solo en el Mac.", systemImage: "creditcard")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+
+                    Text(relay.voiceInputMode.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
                 Section("Tareas recientes") {
@@ -104,7 +181,9 @@ struct PhoneHomeView: View {
                 }
             }
             .onAppear {
-                bridgeURL = relay.bridgeURL
+                connectionMethod = relay.connectionMethod
+                bridgeHost = relay.bridgeHost
+                bridgePort = String(relay.bridgePort)
                 accessToken = relay.accessToken
             }
             .refreshable { await relay.refreshTasks() }
@@ -112,10 +191,30 @@ struct PhoneHomeView: View {
     }
 
     private func connect() {
-        guard !relay.isConnecting, !bridgeURL.isEmpty, accessToken.count == 43 else { return }
+        guard !relay.isConnecting,
+              !bridgeHost.isEmpty,
+              let port = Int(bridgePort),
+              (1...65_535).contains(port),
+              accessToken.count == 43 else { return }
         focusedField = nil
         connectAttempts += 1
-        relay.configure(baseURL: bridgeURL, accessToken: accessToken)
+        relay.configure(
+            method: connectionMethod,
+            host: bridgeHost,
+            port: port,
+            accessToken: accessToken
+        )
+    }
+
+    private var connectionHelp: String {
+        switch connectionMethod {
+        case .zeroTierVPN:
+            "Introduce manualmente la IP privada del Mac en ZeroTier, Tailscale o WireGuard."
+        case .localNetwork:
+            "Usa la IP privada o el nombre .local del Mac cuando ambos dispositivos estén en la misma red."
+        case .secureHTTPS:
+            "Para una IP pública o un dominio se exige HTTPS mediante un proxy seguro delante del puente."
+        }
     }
 }
 
@@ -127,8 +226,12 @@ final class PhoneRelay: NSObject, ObservableObject {
     @Published private(set) var statusMessage = "Esperando al puente del Mac"
     @Published private(set) var isConnected = false
     @Published private(set) var isConnecting = false
-    @Published private(set) var bridgeURL: String
+    @Published private(set) var connectionMethod: MacConnectionMethod
+    @Published private(set) var bridgeHost: String
+    @Published private(set) var bridgePort: Int
     @Published private(set) var accessToken: String
+    @Published private(set) var voiceInputMode: VoiceInputMode
+    @Published private(set) var transcriptionModel: OpenAITranscriptionModel
 
     private let session: WCSession? = WCSession.isSupported() ? .default : nil
     private var pollingTask: Task<Void, Never>?
@@ -137,9 +240,24 @@ final class PhoneRelay: NSObject, ObservableObject {
     private static let tokenAccount = "bridge-access-token"
 
     private override init() {
-        bridgeURL = UserDefaults.standard.string(forKey: "bridgeURL") ?? ""
+        let defaults = UserDefaults.standard
+        let legacyURL = defaults.string(forKey: "bridgeURL").flatMap(URLComponents.init(string:))
+        let savedConnectionMethod = MacConnectionMethod(
+            rawValue: defaults.string(forKey: "connectionMethod") ?? ""
+        ) ?? ((legacyURL?.scheme == "https") ? .secureHTTPS : .zeroTierVPN)
+        connectionMethod = savedConnectionMethod
+        bridgeHost = defaults.string(forKey: "bridgeHost") ?? legacyURL?.host ?? ""
+        bridgePort = defaults.object(forKey: "bridgePort") as? Int
+            ?? legacyURL?.port
+            ?? savedConnectionMethod.defaultPort
         accessToken = (try? SecureTokenStore.load(service: Self.tokenService, account: Self.tokenAccount)) ?? ""
-        UserDefaults.standard.removeObject(forKey: "pairingCode")
+        voiceInputMode = VoiceInputMode(
+            rawValue: defaults.string(forKey: "voiceInputMode") ?? ""
+        ) ?? .watchDictation
+        transcriptionModel = OpenAITranscriptionModel(
+            rawValue: defaults.string(forKey: "transcriptionModel") ?? ""
+        ) ?? .gptTranscribe
+        defaults.removeObject(forKey: "pairingCode")
         super.init()
         session?.delegate = self
         session?.activate()
@@ -160,10 +278,16 @@ final class PhoneRelay: NSObject, ObservableObject {
         }
     }
 
-    func configure(baseURL: String, accessToken: String) {
-        self.bridgeURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+    func configure(method: MacConnectionMethod, host: String, port: Int, accessToken: String) {
+        connectionMethod = method
+        bridgeHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        bridgePort = port
         self.accessToken = accessToken.trimmingCharacters(in: .whitespacesAndNewlines)
-        UserDefaults.standard.set(self.bridgeURL, forKey: "bridgeURL")
+        let defaults = UserDefaults.standard
+        defaults.set(connectionMethod.rawValue, forKey: "connectionMethod")
+        defaults.set(bridgeHost, forKey: "bridgeHost")
+        defaults.set(bridgePort, forKey: "bridgePort")
+        defaults.removeObject(forKey: "bridgeURL")
         do {
             try SecureTokenStore.save(self.accessToken, service: Self.tokenService, account: Self.tokenAccount)
         } catch {
@@ -179,6 +303,18 @@ final class PhoneRelay: NSObject, ObservableObject {
         }
     }
 
+    func setVoiceInputMode(_ mode: VoiceInputMode) {
+        voiceInputMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: "voiceInputMode")
+        pushTasksToWatch()
+    }
+
+    func setTranscriptionModel(_ model: OpenAITranscriptionModel) {
+        transcriptionModel = model
+        UserDefaults.standard.set(model.rawValue, forKey: "transcriptionModel")
+        pushTasksToWatch()
+    }
+
     func refreshTasks() async {
         guard !accessToken.isEmpty else {
             statusMessage = "Pega el token mostrado por el puente del Mac"
@@ -186,11 +322,11 @@ final class PhoneRelay: NSObject, ObservableObject {
             return
         }
         do {
-            let candidates = [bridgeURL].filter { !$0.isEmpty }
+            let candidates = [configuredBridgeURL].compactMap { $0 }
             var received: [CodexTask]?
             var lastError: Error?
             for candidate in candidates {
-                statusMessage = "Probando ZeroTier…"
+                statusMessage = "Conectando con el Mac…"
                 do {
                     received = try await MacBridgeClient(baseURL: candidate, token: accessToken).fetchTasks()
                     activeBridgeURL = candidate
@@ -216,7 +352,7 @@ final class PhoneRelay: NSObject, ObservableObject {
             case .timedOut: return "el Mac no respondió a tiempo"
             case .cannotConnectToHost, .cannotFindHost: return "no se encuentra el bridge en la red"
             case .notConnectedToInternet: return "el iPhone no tiene red disponible"
-            case .unsupportedURL: return "usa la URL privada de ZeroTier con el puerto 48720"
+            case .unsupportedURL: return "revisa la IP, el puerto y el método de conexión"
             default: return urlError.localizedDescription
             }
         }
@@ -225,11 +361,19 @@ final class PhoneRelay: NSObject, ObservableObject {
 
     private func pushTasksToWatch() {
         guard let data = try? CodexWatchWire.encode(tasks) else { return }
-        try? session?.updateApplicationContext([CodexWatchWire.tasks: data])
+        let context: [String: Any] = [
+            CodexWatchWire.tasks: data,
+            CodexWatchWire.voiceInputMode: voiceInputMode.rawValue,
+            CodexWatchWire.transcriptionModel: transcriptionModel.rawValue
+        ]
+        try? session?.updateApplicationContext(context)
+        if session?.isReachable == true {
+            session?.sendMessage([CodexWatchWire.tasksResponse: data], replyHandler: nil)
+        }
     }
 
     private func fetchConversation(taskID: String) async throws -> CodexConversation {
-        let candidates = [activeBridgeURL, bridgeURL]
+        let candidates = [activeBridgeURL, configuredBridgeURL]
             .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
             .reduce(into: [String]()) { result, candidate in
@@ -252,7 +396,10 @@ final class PhoneRelay: NSObject, ObservableObject {
     private func submit(_ command: CodexCommand) {
         Task {
             do {
-                let client = MacBridgeClient(baseURL: activeBridgeURL ?? bridgeURL, token: accessToken)
+                guard let baseURL = activeBridgeURL ?? configuredBridgeURL else {
+                    throw URLError(.badURL)
+                }
+                let client = MacBridgeClient(baseURL: baseURL, token: accessToken)
                 _ = try await client.submit(command)
                 statusMessage = "Orden enviada a \(command.taskTitle)"
             } catch {
@@ -260,10 +407,61 @@ final class PhoneRelay: NSObject, ObservableObject {
             }
         }
     }
+
+    private func submitVoice(_ command: CodexVoiceCommand, audioURL: URL) async {
+        defer { try? FileManager.default.removeItem(at: audioURL) }
+        let queued = CommandReceipt(
+            commandID: command.id,
+            state: .queued,
+            message: "Transcribiendo en el Mac…"
+        )
+        sendReceiptToWatch(queued)
+        do {
+            guard let baseURL = activeBridgeURL ?? configuredBridgeURL else {
+                throw URLError(.badURL)
+            }
+            let audio = try Data(contentsOf: audioURL, options: [.mappedIfSafe])
+            let receipt = try await MacBridgeClient(baseURL: baseURL, token: accessToken)
+                .submitVoice(command, audio: audio)
+            statusMessage = receipt.state == .sent
+                ? "Nota de voz enviada a \(command.taskTitle)"
+                : receipt.message
+            isConnected = true
+            sendReceiptToWatch(receipt)
+            await refreshTasks()
+        } catch {
+            let receipt = CommandReceipt(
+                commandID: command.id,
+                state: .failed,
+                message: "No se pudo enviar: \(Self.describe(error))"
+            )
+            statusMessage = receipt.message
+            sendReceiptToWatch(receipt)
+        }
+    }
+
+    private func sendReceiptToWatch(_ receipt: CommandReceipt) {
+        guard let data = try? CodexWatchWire.encode(receipt), let session else { return }
+        if session.isReachable {
+            session.sendMessage([CodexWatchWire.commandReceipt: data], replyHandler: nil)
+        }
+        session.transferUserInfo([CodexWatchWire.commandReceipt: data])
+    }
+
+    private var configuredBridgeURL: String? {
+        guard !bridgeHost.isEmpty, (1...65_535).contains(bridgePort) else { return nil }
+        let formattedHost = bridgeHost.contains(":") && !bridgeHost.hasPrefix("[")
+            ? "[\(bridgeHost)]"
+            : bridgeHost
+        return "\(connectionMethod.scheme)://\(formattedHost):\(bridgePort)"
+    }
 }
 
 extension PhoneRelay: WCSessionDelegate {
-    nonisolated func session(_ session: WCSession, activationDidCompleteWith activationState: WCSessionActivationState, error: Error?) {}
+    nonisolated func session(_ session: WCSession, activationDidCompleteWith activationState: WCSessionActivationState, error: Error?) {
+        guard activationState == .activated, error == nil else { return }
+        Task { @MainActor [weak self] in self?.pushTasksToWatch() }
+    }
     nonisolated func sessionDidBecomeInactive(_ session: WCSession) {}
     nonisolated func sessionDidDeactivate(_ session: WCSession) { session.activate() }
 
@@ -307,13 +505,61 @@ extension PhoneRelay: WCSessionDelegate {
     }
 
     nonisolated func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
-        guard let data = userInfo[CodexWatchWire.command] as? Data else { return }
-        receiveCommand(data)
+        if let data = userInfo[CodexWatchWire.command] as? Data {
+            receiveCommand(data)
+            return
+        }
+        if userInfo[CodexWatchWire.tasksRequest] as? Bool == true {
+            Task { @MainActor [weak self] in
+                await self?.refreshTasks()
+            }
+        }
+    }
+
+    nonisolated func session(_ session: WCSession, didReceive file: WCSessionFile) {
+        guard let metadata = file.metadata?[CodexWatchWire.voiceCommand] as? Data,
+              let command = try? CodexWatchWire.decode(CodexVoiceCommand.self, from: metadata) else { return }
+        guard let copiedURL = Self.copyReceivedVoiceFile(file.fileURL, commandID: command.id) else {
+            Task { @MainActor [weak self] in
+                self?.sendReceiptToWatch(CommandReceipt(
+                    commandID: command.id,
+                    state: .failed,
+                    message: "El iPhone no pudo guardar el audio recibido"
+                ))
+            }
+            return
+        }
+        Task { @MainActor [weak self] in
+            await self?.submitVoice(command, audioURL: copiedURL)
+        }
+    }
+
+    nonisolated func sessionReachabilityDidChange(_ session: WCSession) {
+        guard session.isReachable else { return }
+        Task { @MainActor [weak self] in
+            self?.pushTasksToWatch()
+        }
     }
 
     private nonisolated func receiveCommand(_ data: Data) {
         guard let command = try? CodexWatchWire.decode(CodexCommand.self, from: data) else { return }
         Task { @MainActor [weak self] in self?.submit(command) }
+    }
+
+    private nonisolated static func copyReceivedVoiceFile(_ source: URL, commandID: UUID) -> URL? {
+        let directory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("ReceivedVoiceCommands", isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let destination = directory.appendingPathComponent(commandID.uuidString).appendingPathExtension("m4a")
+            if FileManager.default.fileExists(atPath: destination.path) {
+                try FileManager.default.removeItem(at: destination)
+            }
+            try FileManager.default.copyItem(at: source, to: destination)
+            return destination
+        } catch {
+            return nil
+        }
     }
 }
 
@@ -336,7 +582,7 @@ private struct MacBridgeClient: Sendable {
     func fetchTasks() async throws -> [CodexTask] {
         let request = try request(path: "/tasks")
         let (data, response) = try await URLSession.shared.data(for: request)
-        try validate(response)
+        try validate(response, data: data)
         return try CodexWatchWire.decode([CodexTask].self, from: data)
     }
 
@@ -346,14 +592,29 @@ private struct MacBridgeClient: Sendable {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try CodexWatchWire.encode(command)
         let (data, response) = try await URLSession.shared.data(for: request)
-        try validate(response)
+        try validate(response, data: data)
+        return try CodexWatchWire.decode(CommandReceipt.self, from: data)
+    }
+
+    func submitVoice(_ command: CodexVoiceCommand, audio: Data) async throws -> CommandReceipt {
+        var request = try request(path: "/voice-commands")
+        request.httpMethod = "POST"
+        request.setValue("audio/mp4", forHTTPHeaderField: "Content-Type")
+        request.setValue(
+            try CodexWatchWire.encode(command).base64EncodedString(),
+            forHTTPHeaderField: "X-CodexWatch-Voice-Metadata"
+        )
+        request.httpBody = audio
+        request.timeoutInterval = 75
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validate(response, data: data)
         return try CodexWatchWire.decode(CommandReceipt.self, from: data)
     }
 
     func fetchConversation(taskID: String) async throws -> CodexConversation {
         let request = try request(path: "/tasks/\(taskID)/messages")
         let (data, response) = try await URLSession.shared.data(for: request)
-        try validate(response)
+        try validate(response, data: data)
         return try CodexWatchWire.decode(CodexConversation.self, from: data)
     }
 
@@ -369,34 +630,50 @@ private struct MacBridgeClient: Sendable {
     private func validatedBaseURL() throws -> String {
         let trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let components = URLComponents(string: trimmed),
-              components.scheme?.lowercased() == "http",
+              let scheme = components.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
               components.user == nil,
               components.password == nil,
               components.query == nil,
               components.fragment == nil,
               components.path.isEmpty || components.path == "/",
               let host = components.host,
-              Self.isPrivateIPv4(host),
               let port = components.port,
-              port == 48720 else {
+              (1...65_535).contains(port),
+              scheme == "https" || Self.isPrivateHost(host) else {
             throw URLError(.unsupportedURL)
         }
-        return "http://\(host):\(port)"
+        let formattedHost = host.contains(":") ? "[\(host)]" : host
+        return "\(scheme)://\(formattedHost):\(port)"
     }
 
-    private static func isPrivateIPv4(_ value: String) -> Bool {
+    private static func isPrivateHost(_ value: String) -> Bool {
+        if value.lowercased().hasSuffix(".local") { return true }
         let octets = value.split(separator: ".").compactMap { UInt8($0) }
         guard octets.count == 4 else { return false }
+        if octets[0] == 127 { return true }
         if octets[0] == 10 { return true }
         if octets[0] == 172, (16...31).contains(octets[1]) { return true }
         if octets[0] == 192, octets[1] == 168 { return true }
+        if octets[0] == 100, (64...127).contains(octets[1]) { return true }
+        if octets[0] == 169, octets[1] == 254 { return true }
         return false
     }
 
-    private func validate(_ response: URLResponse) throws {
+    private func validate(_ response: URLResponse, data: Data) throws {
         guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
         guard (200..<300).contains(http.statusCode) else {
-            throw NSError(domain: "CodexWatch", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "El puente respondió con código \(http.statusCode)"])
+            let responseMessage = String(data: data.prefix(500), encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            throw NSError(
+                domain: "CodexWatch",
+                code: http.statusCode,
+                userInfo: [
+                    NSLocalizedDescriptionKey: responseMessage?.isEmpty == false
+                        ? responseMessage!
+                        : "El puente respondió con código \(http.statusCode)"
+                ]
+            )
         }
     }
 }

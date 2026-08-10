@@ -8,46 +8,91 @@ struct CodexWatchBridgeApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            VStack(alignment: .leading, spacing: 8) {
-                Text(controller.status).font(.headline)
-                Text("Acceso protegido por un token de 256 bits")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Divider()
-                Button("Copiar token de acceso") { controller.copyAccessToken() }
-                Button("Actualizar tareas") { Task { await controller.refreshTasks() } }
-                Button("Salir") { NSApplication.shared.terminate(nil) }
-            }
-            .padding()
+            BridgeMenuView(controller: controller)
         } label: {
             BridgeStatusIcon(isConnected: controller.isReady)
                 .help(controller.isReady ? "Codex Watch conectado" : "Codex Watch desconectado")
         }
 
         Window("Codex Watch Bridge", id: "bridge") {
-            VStack(alignment: .leading, spacing: 16) {
-                Text("Codex Watch Bridge").font(.largeTitle.bold())
-                Text(controller.status)
-                GroupBox("Emparejamiento") {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text(controller.accessToken)
-                            .font(.system(.body, design: .monospaced))
-                            .textSelection(.enabled)
-                        HStack {
-                            Button("Copiar token") { controller.copyAccessToken() }
-                            Spacer()
-                            Button("Revocar y generar otro") { controller.regenerateAccessToken() }
-                        }
+            BridgeConfigurationView(controller: controller)
+        }
+    }
+}
+
+private struct BridgeMenuView: View {
+    @ObservedObject var controller: BridgeController
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(controller.status).font(.headline)
+            Text("Voz: dictado del Watch u OpenAI API")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Divider()
+            Button("Copiar token de acceso") { controller.copyAccessToken() }
+            Button("Configurar conexión…") {
+                NSApplication.shared.activate(ignoringOtherApps: true)
+                openWindow(id: "bridge")
+            }
+            Button("Actualizar tareas") { Task { await controller.refreshTasks() } }
+            Button("Salir") { NSApplication.shared.terminate(nil) }
+        }
+        .padding()
+    }
+}
+
+private struct BridgeConfigurationView: View {
+    @ObservedObject var controller: BridgeController
+    @State private var openAIAPIKey = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Codex Watch Bridge").font(.largeTitle.bold())
+            Text(controller.status)
+            GroupBox("Emparejamiento") {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(controller.accessToken)
+                        .font(.system(.body, design: .monospaced))
+                        .textSelection(.enabled)
+                    HStack {
+                        Button("Copiar token") { controller.copyAccessToken() }
+                        Spacer()
+                        Button("Revocar y generar otro") { controller.regenerateAccessToken() }
                     }
                     Text("Pega este token en la app del iPhone. Al regenerarlo se desconectarán los dispositivos actuales.")
                         .foregroundStyle(.secondary)
                 }
-                Text("Tareas disponibles: \(controller.tasks.count)")
-                Spacer()
             }
-            .padding(24)
-            .frame(minWidth: 480, minHeight: 300)
+            GroupBox("Transcripción de notas de voz") {
+                VStack(alignment: .leading, spacing: 10) {
+                    Label(
+                        controller.hasOpenAIAPIKey ? "API key configurada" : "API key no configurada",
+                        systemImage: controller.hasOpenAIAPIKey ? "checkmark.shield.fill" : "key"
+                    )
+                    .foregroundStyle(controller.hasOpenAIAPIKey ? .green : .orange)
+                    SecureField("OpenAI API key", text: $openAIAPIKey)
+                        .textFieldStyle(.roundedBorder)
+                    Button("Guardar API key en el llavero") {
+                        if controller.saveOpenAIAPIKey(openAIAPIKey) {
+                            openAIAPIKey = ""
+                        }
+                    }
+                    .disabled(openAIAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Text("Solo se usa cuando el Companion selecciona OpenAI API. La transcripción genera facturación en tu cuenta de API.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("La clave permanece en el llavero del Mac y nunca se envía al iPhone, al Watch ni se guarda en el repositorio.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Text("Tareas disponibles: \(controller.tasks.count)")
+            Spacer()
         }
+        .padding(24)
+        .frame(minWidth: 520, minHeight: 430)
     }
 }
 
@@ -55,19 +100,24 @@ struct CodexWatchBridgeApp: App {
 final class BridgeController: ObservableObject {
     private static let tokenService = "com.rgferreira.CodexWatchBridge"
     private static let tokenAccount = "bridge-access-token"
+    private static let openAIKeyService = "com.rgferreira.CodexWatchBridge.openai"
+    private static let openAIKeyAccount = "api-key"
     private static let logger = Logger(subsystem: "com.rgferreira.CodexWatchBridge", category: "Bridge")
 
     @Published private(set) var status = "Iniciando…"
     @Published private(set) var isReady = false
     @Published private(set) var tasks: [CodexTask] = []
     @Published private(set) var accessToken = ""
+    @Published private(set) var hasOpenAIAPIKey = false
 
     private let appServer = CodexAppServerClient()
+    private let openAITranscriber = OpenAITranscriptionClient()
     private var httpServer: LocalHTTPServer?
     private var retryTask: Task<Void, Never>?
     private var isHTTPReady = false
     private var isCodexReady = false
     private var authenticationLimiter = AuthenticationRateLimiter()
+    private var voiceReceipts: [UUID: CommandReceipt] = [:]
 
     init() {
         UserDefaults.standard.removeObject(forKey: "pairingCode")
@@ -76,6 +126,10 @@ final class BridgeController: ObservableObject {
                 service: Self.tokenService,
                 account: Self.tokenAccount
             )
+            hasOpenAIAPIKey = try SecureTokenStore.load(
+                service: Self.openAIKeyService,
+                account: Self.openAIKeyAccount
+            ) != nil
         } catch {
             status = "No se pudo acceder al llavero: \(error.localizedDescription)"
         }
@@ -101,6 +155,23 @@ final class BridgeController: ObservableObject {
         }
     }
 
+    func saveOpenAIAPIKey(_ rawValue: String) -> Bool {
+        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return false }
+        do {
+            try SecureTokenStore.save(
+                value,
+                service: Self.openAIKeyService,
+                account: Self.openAIKeyAccount
+            )
+            hasOpenAIAPIKey = true
+            return true
+        } catch {
+            status = "No se pudo guardar la API key: \(error.localizedDescription)"
+            return false
+        }
+    }
+
     func refreshTasks() async {
         do {
             tasks = try await appServer.listTasks()
@@ -121,13 +192,13 @@ final class BridgeController: ObservableObject {
                 do {
                     try appServer.start()
                     if httpServer == nil {
-                        let network = try ZeroTierAddressDetector.activeIPv4Network()
-                        httpServer = try LocalHTTPServer(allowedIPv4Address: network.address, prefixLength: network.prefixLength, port: 48720, onStateChange: { [weak self] ready, error in
+                        let network = try? ZeroTierAddressDetector.activeIPv4Network()
+                        httpServer = try LocalHTTPServer(allowedIPv4Address: network?.address ?? "127.0.0.1", prefixLength: network?.prefixLength ?? 32, port: 48720, onStateChange: { [weak self] ready, error in
                             Task { @MainActor [weak self] in
                                 guard let self else { return }
                                 isHTTPReady = ready
                                 if let error {
-                                    status = "Error de la red privada: \(error)"
+                                    status = "Error de red: \(error)"
                                     httpServer = nil
                                 }
                                 updateReadiness()
@@ -139,7 +210,7 @@ final class BridgeController: ObservableObject {
                     }
                     await refreshTasks()
                 } catch {
-                    status = "Reintentando la conexión privada…"
+                    status = "Reintentando la conexión con Codex…"
                     isReady = false
                 }
                 try? await Task.sleep(for: .seconds(10))
@@ -151,9 +222,9 @@ final class BridgeController: ObservableObject {
         isReady = isHTTPReady && isCodexReady
         if preserveStatus { return }
         if isReady {
-            status = "Conectado a Codex · solo por ZeroTier"
+            status = "Conectado a Codex · red privada preparada"
         } else if !isHTTPReady && isCodexReady {
-            status = "Codex disponible · esperando a ZeroTier…"
+            status = "Codex disponible · iniciando el puente…"
         }
     }
 
@@ -175,6 +246,8 @@ final class BridgeController: ObservableObject {
                 Self.logger.error("No se pudo enviar una orden: \(error.localizedDescription, privacy: .private)")
                 return .serverError()
             }
+        case ("POST", "/voice-commands"):
+            return await handleVoiceCommand(request)
         default:
             let prefix = "/tasks/"
             let suffix = "/messages"
@@ -193,6 +266,54 @@ final class BridgeController: ObservableObject {
                 }
             }
             return .notFound
+        }
+    }
+
+    private func handleVoiceCommand(_ request: HTTPRequest) async -> HTTPResponse {
+        guard request.headers["content-type"]?.lowercased().hasPrefix("audio/mp4") == true,
+              let encodedMetadata = request.headers["x-codexwatch-voice-metadata"],
+              let metadata = Data(base64Encoded: encodedMetadata),
+              let voiceCommand = try? CodexWatchWire.decode(CodexVoiceCommand.self, from: metadata),
+              !request.body.isEmpty else {
+            return .badRequest
+        }
+        if let existing = voiceReceipts[voiceCommand.id] { return .encodable(existing) }
+
+        let audioURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("codexwatch-\(voiceCommand.id.uuidString)")
+            .appendingPathExtension("m4a")
+        defer { try? FileManager.default.removeItem(at: audioURL) }
+
+        do {
+            try request.body.write(to: audioURL, options: .atomic)
+            guard let apiKey = try SecureTokenStore.load(
+                service: Self.openAIKeyService,
+                account: Self.openAIKeyAccount
+            ) else {
+                throw OpenAITranscriptionClient.TranscriptionError.missingAPIKey
+            }
+            let transcript = try await openAITranscriber.transcribe(
+                audioURL: audioURL,
+                model: voiceCommand.transcriptionModel,
+                apiKey: apiKey
+            )
+            try await appServer.send(CodexCommand(voiceCommand: voiceCommand, text: transcript))
+            let receipt = CommandReceipt(
+                commandID: voiceCommand.id,
+                state: .sent,
+                message: "Orden transcrita y enviada"
+            )
+            voiceReceipts[voiceCommand.id] = receipt
+            if voiceReceipts.count > 100 { voiceReceipts.removeValue(forKey: voiceReceipts.keys.first!) }
+            return .encodable(receipt)
+        } catch {
+            Self.logger.error("No se pudo procesar una nota de voz: \(error.localizedDescription, privacy: .private)")
+            let receipt = CommandReceipt(
+                commandID: voiceCommand.id,
+                state: .failed,
+                message: error.localizedDescription
+            )
+            return .encodable(receipt)
         }
     }
 
