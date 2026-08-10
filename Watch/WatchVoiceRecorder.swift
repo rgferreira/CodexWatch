@@ -18,6 +18,7 @@ final class WatchVoiceRecorder: NSObject, ObservableObject {
 
     private var recorder: AVAudioRecorder?
     private var timerTask: Task<Void, Never>?
+    private var finalizationTask: Task<Void, Never>?
 
     override init() {
         super.init()
@@ -26,6 +27,7 @@ final class WatchVoiceRecorder: NSObject, ObservableObject {
 
     deinit {
         timerTask?.cancel()
+        finalizationTask?.cancel()
     }
 
     func start() async {
@@ -70,14 +72,30 @@ final class WatchVoiceRecorder: NSObject, ObservableObject {
     }
 
     func stop() {
-        guard state == .recording else { return }
-        recorder?.stop()
-        finishRecording(successfully: true)
+        guard state == .recording, let recorder else { return }
+        // `currentTime` can return to zero as soon as `stop()` closes the
+        // recorder. Preserve it first and wait for the delegate to confirm
+        // that the AAC container has finished writing.
+        duration = max(duration, recorder.currentTime)
+        timerTask?.cancel()
+        timerTask = nil
+        recorder.stop()
+
+        // Defensive fallback for watchOS versions that occasionally omit the
+        // completion delegate after a user-initiated stop.
+        finalizationTask?.cancel()
+        finalizationTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(750))
+            guard !Task.isCancelled, let self, state == .recording else { return }
+            finishRecording(successfully: true)
+        }
     }
 
     func discard() {
         timerTask?.cancel()
         timerTask = nil
+        finalizationTask?.cancel()
+        finalizationTask = nil
         if recorder?.isRecording == true { recorder?.stop() }
         recorder = nil
         if let recordingURL { try? FileManager.default.removeItem(at: recordingURL) }
@@ -118,7 +136,9 @@ final class WatchVoiceRecorder: NSObject, ObservableObject {
         guard state == .recording else { return }
         timerTask?.cancel()
         timerTask = nil
-        duration = recorder?.currentTime ?? duration
+        finalizationTask?.cancel()
+        finalizationTask = nil
+        duration = max(duration, recorder?.currentTime ?? 0)
         recorder = nil
         deactivateAudioSession()
 
