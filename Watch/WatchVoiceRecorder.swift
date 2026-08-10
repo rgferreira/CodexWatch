@@ -83,12 +83,7 @@ final class WatchVoiceRecorder: NSObject, ObservableObject {
 
         // Defensive fallback for watchOS versions that occasionally omit the
         // completion delegate after a user-initiated stop.
-        finalizationTask?.cancel()
-        finalizationTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(750))
-            guard !Task.isCancelled, let self, state == .recording else { return }
-            finishRecording(successfully: true)
-        }
+        scheduleFinalization(successfully: true, after: .milliseconds(900))
     }
 
     func discard() {
@@ -142,19 +137,36 @@ final class WatchVoiceRecorder: NSObject, ObservableObject {
         recorder = nil
         deactivateAudioSession()
 
+        // Reading the data verifies that the file is closed and accessible.
+        // Do not reject short recordings locally: the transcription service
+        // can provide the accurate no-speech/invalid-audio error.
         let fileSize = recordingURL.flatMap {
-            try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize
+            try? Data(contentsOf: $0, options: [.mappedIfSafe]).count
         } ?? 0
-        guard success,
-              let recordingURL,
-              duration >= 0.4,
-              fileSize > 0 else {
+        guard let recordingURL, fileSize > 0 else {
             if let recordingURL { try? FileManager.default.removeItem(at: recordingURL) }
             self.recordingURL = nil
-            state = .failed("La grabación está vacía")
+            state = .failed(
+                success
+                    ? "El Watch no generó el fichero de audio"
+                    : "El Watch no pudo cerrar la grabación"
+            )
             return
         }
         state = .ready
+    }
+
+    private func scheduleFinalization(
+        successfully success: Bool,
+        after delay: Duration
+    ) {
+        guard state == .recording else { return }
+        finalizationTask?.cancel()
+        finalizationTask = Task { [weak self] in
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled, let self, state == .recording else { return }
+            finishRecording(successfully: success)
+        }
     }
 
     private func deactivateAudioSession() {
@@ -187,12 +199,17 @@ final class WatchVoiceRecorder: NSObject, ObservableObject {
 
 extension WatchVoiceRecorder: AVAudioRecorderDelegate {
     nonisolated func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
-        Task { @MainActor [weak self] in self?.finishRecording(successfully: flag) }
+        Task { @MainActor [weak self] in
+            // The delegate can arrive before watchOS has made the final AAC
+            // bytes visible to the file system. Give the encoder a brief
+            // settling interval before validating the M4A.
+            self?.scheduleFinalization(successfully: flag, after: .milliseconds(300))
+        }
     }
 
     nonisolated func audioRecorderEncodeErrorDidOccur(_ recorder: AVAudioRecorder, error: Error?) {
         Task { @MainActor [weak self] in
-            self?.finishRecording(successfully: false)
+            self?.scheduleFinalization(successfully: false, after: .milliseconds(300))
         }
     }
 }

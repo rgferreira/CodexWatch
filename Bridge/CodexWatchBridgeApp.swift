@@ -117,7 +117,7 @@ final class BridgeController: ObservableObject {
     private var isHTTPReady = false
     private var isCodexReady = false
     private var authenticationLimiter = AuthenticationRateLimiter()
-    private var voiceReceipts: [UUID: CommandReceipt] = [:]
+    private var commandReceipts: [UUID: CommandReceipt] = [:]
 
     init() {
         UserDefaults.standard.removeObject(forKey: "pairingCode")
@@ -239,8 +239,10 @@ final class BridgeController: ObservableObject {
         case ("POST", "/commands"):
             do {
                 let command = try CodexWatchWire.decode(CodexCommand.self, from: request.body)
+                if let existing = commandReceipts[command.id] { return .encodable(existing) }
                 try await appServer.send(command)
                 let receipt = CommandReceipt(commandID: command.id, state: .sent, message: "Orden enviada")
+                remember(receipt)
                 return .encodable(receipt)
             } catch {
                 Self.logger.error("No se pudo enviar una orden: \(error.localizedDescription, privacy: .private)")
@@ -277,7 +279,7 @@ final class BridgeController: ObservableObject {
               !request.body.isEmpty else {
             return .badRequest
         }
-        if let existing = voiceReceipts[voiceCommand.id] { return .encodable(existing) }
+        if let existing = commandReceipts[voiceCommand.id] { return .encodable(existing) }
 
         let audioURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("codexwatch-\(voiceCommand.id.uuidString)")
@@ -303,8 +305,7 @@ final class BridgeController: ObservableObject {
                 state: .sent,
                 message: "Orden transcrita y enviada"
             )
-            voiceReceipts[voiceCommand.id] = receipt
-            if voiceReceipts.count > 100 { voiceReceipts.removeValue(forKey: voiceReceipts.keys.first!) }
+            remember(receipt)
             return .encodable(receipt)
         } catch {
             Self.logger.error("No se pudo procesar una nota de voz: \(error.localizedDescription, privacy: .private)")
@@ -314,6 +315,13 @@ final class BridgeController: ObservableObject {
                 message: error.localizedDescription
             )
             return .encodable(receipt)
+        }
+    }
+
+    private func remember(_ receipt: CommandReceipt) {
+        commandReceipts[receipt.commandID] = receipt
+        if commandReceipts.count > 100 {
+            commandReceipts.removeValue(forKey: commandReceipts.keys.first!)
         }
     }
 

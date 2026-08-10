@@ -103,7 +103,6 @@ struct VoiceCommandView: View {
   @StateObject private var recorder = WatchVoiceRecorder()
   @State private var commandID: UUID?
   @State private var transcript = ""
-  @State private var sent = false
 
   private var recentMessages: [CodexMessage] {
     relay.conversations[task.id] ?? []
@@ -209,22 +208,29 @@ struct VoiceCommandView: View {
         .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
 
       Button("Enviar") {
-        relay.send(CodexCommand(task: task, text: transcript))
-        WKInterfaceDevice.current().play(.success)
-        sent = true
+        commandID = relay.send(CodexCommand(task: task, text: transcript))
+        WKInterfaceDevice.current().play(.click)
       }
       .tint(.green)
+      .disabled(receipt?.state == .queued)
     }
 
-    if sent {
-      Label("Enviado", systemImage: "checkmark.circle.fill")
-        .foregroundStyle(.green)
-        .onAppear {
-          Task {
-            try? await Task.sleep(for: .seconds(1))
-            dismiss()
-          }
+    if let receipt {
+      switch receipt.state {
+      case .queued:
+        HStack {
+          ProgressView()
+          Text(receipt.message).font(.caption2)
         }
+      case .sent:
+        Label(receipt.message, systemImage: "checkmark.circle.fill")
+          .font(.caption)
+          .foregroundStyle(.green)
+      case .failed:
+        Label(receipt.message, systemImage: "xmark.circle.fill")
+          .font(.caption2)
+          .foregroundStyle(.red)
+      }
     }
   }
 
@@ -413,15 +419,42 @@ final class WatchRelay: NSObject, ObservableObject {
     )
   }
 
-  func send(_ command: CodexCommand) {
-    guard let data = try? CodexWatchWire.encode(command), let session else { return }
+  func send(_ command: CodexCommand) -> UUID {
+    commandReceipts[command.id] = CommandReceipt(
+      commandID: command.id,
+      state: .queued,
+      message: "Enviando al Mac…"
+    )
+    guard let data = try? CodexWatchWire.encode(command),
+          let session,
+          session.activationState == .activated else {
+      commandReceipts[command.id] = CommandReceipt(
+        commandID: command.id,
+        state: .failed,
+        message: "El Watch no está conectado con el iPhone"
+      )
+      return command.id
+    }
     if session.isReachable {
-      session.sendMessageData(data, replyHandler: nil) { _ in
-        session.transferUserInfo([CodexWatchWire.command: data])
-      }
+      let replyHandler = WatchCommandReplyHandler(
+        commandID: command.id,
+        commandData: data,
+        session: session
+      )
+      session.sendMessage(
+        [CodexWatchWire.command: data],
+        replyHandler: replyHandler.receive,
+        errorHandler: replyHandler.fail
+      )
     } else {
       session.transferUserInfo([CodexWatchWire.command: data])
+      commandReceipts[command.id] = CommandReceipt(
+        commandID: command.id,
+        state: .queued,
+        message: "Pendiente de que responda el iPhone…"
+      )
     }
+    return command.id
   }
 
   func sendVoice(task: CodexTask, fileURL: URL) -> UUID? {
@@ -515,6 +548,10 @@ final class WatchRelay: NSObject, ObservableObject {
 
   fileprivate func applyCommandReceipt(_ data: Data) {
     guard let receipt = try? CodexWatchWire.decode(CommandReceipt.self, from: data) else { return }
+    commandReceipts[receipt.commandID] = receipt
+  }
+
+  fileprivate func setCommandReceipt(_ receipt: CommandReceipt) {
     commandReceipts[receipt.commandID] = receipt
   }
 
@@ -654,6 +691,43 @@ private final class WatchConversationReplyHandler: @unchecked Sendable {
   func fail(_ error: Error) {
     Task { @MainActor [taskID] in
       WatchRelay.shared.failConversation(for: taskID, message: "iPhone no disponible")
+    }
+  }
+}
+
+private final class WatchCommandReplyHandler: @unchecked Sendable {
+  private let commandID: UUID
+  private let commandData: Data
+  private let session: WCSession
+
+  init(commandID: UUID, commandData: Data, session: WCSession) {
+    self.commandID = commandID
+    self.commandData = commandData
+    self.session = session
+  }
+
+  func receive(_ reply: [String: Any]) {
+    guard let data = reply[CodexWatchWire.commandReceipt] as? Data else {
+      Task { @MainActor [commandID] in
+        WatchRelay.shared.setCommandReceipt(CommandReceipt(
+          commandID: commandID,
+          state: .failed,
+          message: "El iPhone no confirmó el envío"
+        ))
+      }
+      return
+    }
+    Task { @MainActor in WatchRelay.shared.applyCommandReceipt(data) }
+  }
+
+  func fail(_ error: Error) {
+    session.transferUserInfo([CodexWatchWire.command: commandData])
+    Task { @MainActor [commandID] in
+      WatchRelay.shared.setCommandReceipt(CommandReceipt(
+        commandID: commandID,
+        state: .queued,
+        message: "Envío en segundo plano pendiente…"
+      ))
     }
   }
 }

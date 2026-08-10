@@ -393,18 +393,27 @@ final class PhoneRelay: NSObject, ObservableObject {
         throw lastError ?? URLError(.cannotConnectToHost)
     }
 
-    private func submit(_ command: CodexCommand) {
-        Task {
-            do {
-                guard let baseURL = activeBridgeURL ?? configuredBridgeURL else {
-                    throw URLError(.badURL)
-                }
-                let client = MacBridgeClient(baseURL: baseURL, token: accessToken)
-                _ = try await client.submit(command)
-                statusMessage = "Orden enviada a \(command.taskTitle)"
-            } catch {
-                statusMessage = "No se pudo enviar: \(error.localizedDescription)"
+    private func submit(_ command: CodexCommand) async -> CommandReceipt {
+        do {
+            guard let baseURL = activeBridgeURL ?? configuredBridgeURL else {
+                throw URLError(.badURL)
             }
+            let client = MacBridgeClient(baseURL: baseURL, token: accessToken)
+            let receipt = try await client.submit(command)
+            statusMessage = receipt.state == .sent
+                ? "Orden enviada a \(command.taskTitle)"
+                : receipt.message
+            isConnected = true
+            return receipt
+        } catch {
+            let receipt = CommandReceipt(
+                commandID: command.id,
+                state: .failed,
+                message: "No se pudo enviar: \(Self.describe(error))"
+            )
+            statusMessage = receipt.message
+            isConnected = false
+            return receipt
         }
     }
 
@@ -475,6 +484,10 @@ extension PhoneRelay: WCSessionDelegate {
         replyHandler: @escaping ([String: Any]) -> Void
     ) {
         let reply = WatchReplyHandlerBox(replyHandler)
+        if let commandData = message[CodexWatchWire.command] as? Data {
+            receiveCommand(commandData, reply: reply)
+            return
+        }
         if message[CodexWatchWire.tasksRequest] as? Bool == true {
             Task { @MainActor [weak self] in
                 guard let self else { reply.call([:]); return }
@@ -541,9 +554,30 @@ extension PhoneRelay: WCSessionDelegate {
         }
     }
 
-    private nonisolated func receiveCommand(_ data: Data) {
-        guard let command = try? CodexWatchWire.decode(CodexCommand.self, from: data) else { return }
-        Task { @MainActor [weak self] in self?.submit(command) }
+    private nonisolated func receiveCommand(
+        _ data: Data,
+        reply: WatchReplyHandlerBox? = nil
+    ) {
+        guard let command = try? CodexWatchWire.decode(CodexCommand.self, from: data) else {
+            reply?.call([:])
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self else {
+                reply?.call([:])
+                return
+            }
+            let receipt = await submit(command)
+            guard let receiptData = try? CodexWatchWire.encode(receipt) else {
+                reply?.call([:])
+                return
+            }
+            if let reply {
+                reply.call([CodexWatchWire.commandReceipt: receiptData])
+            } else {
+                sendReceiptToWatch(receipt)
+            }
+        }
     }
 
     private nonisolated static func copyReceivedVoiceFile(_ source: URL, commandID: UUID) -> URL? {
@@ -622,7 +656,9 @@ private struct MacBridgeClient: Sendable {
         let normalized = try validatedBaseURL()
         guard let url = URL(string: normalized + path) else { throw URLError(.badURL) }
         var request = URLRequest(url: url)
-        request.timeoutInterval = path.hasSuffix("/messages") ? 12 : 5
+        request.timeoutInterval = path.hasSuffix("/messages")
+            ? 12
+            : path == "/commands" ? 30 : 5
         request.setValue(token, forHTTPHeaderField: "X-CodexWatch-Token")
         return request
     }
