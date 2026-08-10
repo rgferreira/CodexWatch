@@ -235,6 +235,7 @@ final class PhoneRelay: NSObject, ObservableObject {
 
     private let session: WCSession? = WCSession.isSupported() ? .default : nil
     private var pollingTask: Task<Void, Never>?
+    private var receiptPollingTasks: [UUID: Task<Void, Never>] = [:]
     private var activeBridgeURL: String?
     private static let tokenService = "com.rgferreira.CodexWatch"
     private static let tokenAccount = "bridge-access-token"
@@ -404,6 +405,7 @@ final class PhoneRelay: NSObject, ObservableObject {
                 ? "Orden enviada a \(command.taskTitle)"
                 : receipt.message
             isConnected = true
+            monitorReceiptIfNeeded(receipt, taskTitle: command.taskTitle)
             return receipt
         } catch {
             let receipt = CommandReceipt(
@@ -437,6 +439,7 @@ final class PhoneRelay: NSObject, ObservableObject {
                 : receipt.message
             isConnected = true
             sendReceiptToWatch(receipt)
+            monitorReceiptIfNeeded(receipt, taskTitle: command.taskTitle)
             await refreshTasks()
         } catch {
             let receipt = CommandReceipt(
@@ -455,6 +458,45 @@ final class PhoneRelay: NSObject, ObservableObject {
             session.sendMessage([CodexWatchWire.commandReceipt: data], replyHandler: nil)
         }
         session.transferUserInfo([CodexWatchWire.commandReceipt: data])
+    }
+
+    private func monitorReceiptIfNeeded(_ receipt: CommandReceipt, taskTitle: String) {
+        guard receipt.state == .queued,
+              receiptPollingTasks[receipt.commandID] == nil else { return }
+        let commandID = receipt.commandID
+        receiptPollingTasks[commandID] = Task { [weak self] in
+            defer { self?.receiptPollingTasks[commandID] = nil }
+            for _ in 0..<600 {
+                do {
+                    try await Task.sleep(for: .seconds(3))
+                } catch {
+                    return
+                }
+                guard let self,
+                      let baseURL = activeBridgeURL ?? configuredBridgeURL else { return }
+                do {
+                    let updated = try await MacBridgeClient(baseURL: baseURL, token: accessToken)
+                        .fetchReceipt(commandID: commandID)
+                    sendReceiptToWatch(updated)
+                    switch updated.state {
+                    case .queued:
+                        statusMessage = updated.message
+                    case .sent:
+                        statusMessage = "Orden enviada a \(taskTitle)"
+                        await refreshTasks()
+                        return
+                    case .failed:
+                        statusMessage = updated.message
+                        return
+                    }
+                } catch {
+                    // The bridge owns the durable in-memory retry. A temporary
+                    // phone/network failure must not turn the queued order into
+                    // a false failure on the Watch.
+                    continue
+                }
+            }
+        }
     }
 
     private var configuredBridgeURL: String? {
@@ -640,6 +682,13 @@ private struct MacBridgeClient: Sendable {
         )
         request.httpBody = audio
         request.timeoutInterval = 75
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validate(response, data: data)
+        return try CodexWatchWire.decode(CommandReceipt.self, from: data)
+    }
+
+    func fetchReceipt(commandID: UUID) async throws -> CommandReceipt {
+        let request = try request(path: "/commands/\(commandID.uuidString)")
         let (data, response) = try await URLSession.shared.data(for: request)
         try validate(response, data: data)
         return try CodexWatchWire.decode(CommandReceipt.self, from: data)

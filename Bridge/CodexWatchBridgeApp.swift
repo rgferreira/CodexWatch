@@ -118,6 +118,12 @@ final class BridgeController: ObservableObject {
     private var isCodexReady = false
     private var authenticationLimiter = AuthenticationRateLimiter()
     private var commandReceipts: [UUID: CommandReceipt] = [:]
+    private var pendingDeliveryTasks: [UUID: Task<Void, Never>] = [:]
+
+    private struct PendingDelivery {
+        let command: CodexCommand
+        let successMessage: String
+    }
 
     init() {
         UserDefaults.standard.removeObject(forKey: "pairingCode")
@@ -232,6 +238,15 @@ final class BridgeController: ObservableObject {
         if let rejection = authenticate(request) { return rejection }
         if request.path == "/health" { return .json(["status": "ok"]) }
 
+        if request.method == "GET", request.path.hasPrefix("/commands/") {
+            let rawID = String(request.path.dropFirst("/commands/".count))
+            guard let commandID = UUID(uuidString: rawID),
+                  let receipt = commandReceipts[commandID] else {
+                return .notFound
+            }
+            return .encodable(receipt)
+        }
+
         switch (request.method, request.path) {
         case ("GET", "/tasks"):
             await refreshTasks()
@@ -240,9 +255,9 @@ final class BridgeController: ObservableObject {
             do {
                 let command = try CodexWatchWire.decode(CodexCommand.self, from: request.body)
                 if let existing = commandReceipts[command.id] { return .encodable(existing) }
-                try await appServer.send(command)
-                let receipt = CommandReceipt(commandID: command.id, state: .sent, message: "Orden enviada")
-                remember(receipt)
+                let receipt = await deliverOrQueue(
+                    PendingDelivery(command: command, successMessage: "Orden enviada")
+                )
                 return .encodable(receipt)
             } catch {
                 Self.logger.error("No se pudo enviar una orden: \(error.localizedDescription, privacy: .private)")
@@ -299,13 +314,12 @@ final class BridgeController: ObservableObject {
                 model: voiceCommand.transcriptionModel,
                 apiKey: apiKey
             )
-            try await appServer.send(CodexCommand(voiceCommand: voiceCommand, text: transcript))
-            let receipt = CommandReceipt(
-                commandID: voiceCommand.id,
-                state: .sent,
-                message: "Orden transcrita y enviada"
+            let receipt = await deliverOrQueue(
+                PendingDelivery(
+                    command: CodexCommand(voiceCommand: voiceCommand, text: transcript),
+                    successMessage: "Orden transcrita y enviada"
+                )
             )
-            remember(receipt)
             return .encodable(receipt)
         } catch {
             Self.logger.error("No se pudo procesar una nota de voz: \(error.localizedDescription, privacy: .private)")
@@ -316,6 +330,84 @@ final class BridgeController: ObservableObject {
             )
             return .encodable(receipt)
         }
+    }
+
+    private func deliverOrQueue(_ delivery: PendingDelivery) async -> CommandReceipt {
+        do {
+            try await appServer.send(delivery.command)
+            let receipt = CommandReceipt(
+                commandID: delivery.command.id,
+                state: .sent,
+                message: delivery.successMessage
+            )
+            remember(receipt)
+            return receipt
+        } catch where Self.isActiveWriterError(error) {
+            let receipt = CommandReceipt(
+                commandID: delivery.command.id,
+                state: .queued,
+                message: "Codex está trabajando; orden en cola"
+            )
+            remember(receipt)
+            scheduleRetry(delivery)
+            return receipt
+        } catch {
+            let receipt = CommandReceipt(
+                commandID: delivery.command.id,
+                state: .failed,
+                message: error.localizedDescription
+            )
+            remember(receipt)
+            return receipt
+        }
+    }
+
+    private func scheduleRetry(_ delivery: PendingDelivery) {
+        guard pendingDeliveryTasks[delivery.command.id] == nil else { return }
+        pendingDeliveryTasks[delivery.command.id] = Task { [weak self] in
+            guard let self else { return }
+            await retry(delivery)
+        }
+    }
+
+    private func retry(_ delivery: PendingDelivery) async {
+        defer { pendingDeliveryTasks[delivery.command.id] = nil }
+        // Keep the already-transcribed order in memory for up to 30 minutes.
+        // This covers long Codex turns without billing for transcription twice.
+        for _ in 0..<600 {
+            do {
+                try await Task.sleep(for: .seconds(3))
+            } catch {
+                return
+            }
+            do {
+                try await appServer.send(delivery.command)
+                remember(CommandReceipt(
+                    commandID: delivery.command.id,
+                    state: .sent,
+                    message: delivery.successMessage
+                ))
+                return
+            } catch where Self.isActiveWriterError(error) {
+                continue
+            } catch {
+                remember(CommandReceipt(
+                    commandID: delivery.command.id,
+                    state: .failed,
+                    message: error.localizedDescription
+                ))
+                return
+            }
+        }
+        remember(CommandReceipt(
+            commandID: delivery.command.id,
+            state: .failed,
+            message: "Codex siguió ocupado durante 30 minutos"
+        ))
+    }
+
+    private static func isActiveWriterError(_ error: Error) -> Bool {
+        error.localizedDescription.localizedCaseInsensitiveContains("already has an active writer")
     }
 
     private func remember(_ receipt: CommandReceipt) {

@@ -23,6 +23,8 @@ La app compañera ofrece dos rutas:
 
 El Companion permite seleccionar cualquiera de los seis modelos de transcripción de ficheros admitidos: `gpt-transcribe`, `gpt-4o-transcribe`, `gpt-4o-mini-transcribe`, `gpt-4o-mini-transcribe-2025-12-15`, `gpt-4o-transcribe-diarize` y `whisper-1`. La API key se configura en Codex Watch Bridge y se guarda únicamente en el llavero del Mac.
 
+Si la tarea seleccionada ya tiene un turno activo en la aplicación de Codex, el bridge conserva la orden transcrita y la reintenta automáticamente cuando se libera el escritor. El Watch muestra el estado en cola y recibe la confirmación final sin repetir la transcripción ni su facturación.
+
 ## Fuera de casa
 
 Configura en la app del iPhone el método de conexión, la IP o nombre del Mac, el puerto y el token copiado desde el bridge. La dirección queda guardada únicamente en el dispositivo y no forma parte del código fuente. El token aleatorio de 256 bits se guarda en Keychain tanto en macOS como en iOS. WatchConnectivity mantiene el Apple Watch desacoplado de este detalle: el reloj habla con el iPhone y el iPhone reenvía la petición al Mac.
