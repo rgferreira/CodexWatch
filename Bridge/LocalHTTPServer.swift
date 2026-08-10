@@ -1,5 +1,7 @@
 import Foundation
 import Network
+import Darwin
+import OSLog
 
 struct HTTPRequest: Sendable {
     let method: String
@@ -52,6 +54,14 @@ struct HTTPResponse: Sendable {
 }
 
 final class LocalHTTPServer: @unchecked Sendable {
+    private enum ServerError: LocalizedError {
+        case invalidPrivateNetwork
+
+        var errorDescription: String? {
+            "La red IPv4 privada de ZeroTier no es válida."
+        }
+    }
+
     private enum ParseResult {
         case incomplete
         case request(HTTPRequest)
@@ -62,24 +72,32 @@ final class LocalHTTPServer: @unchecked Sendable {
     private static let maximumBodyBytes = 64 * 1024
     private static let maximumRequestBytes = maximumHeaderBytes + maximumBodyBytes + 4
     private static let maximumConnections = 24
+    private static let logger = Logger(subsystem: "com.rgferreira.CodexWatchBridge", category: "Network")
 
     private let listener: NWListener
     private let queue = DispatchQueue(label: "CodexWatch.HTTPServer")
     private let handler: @Sendable (HTTPRequest) async -> HTTPResponse
+    private let allowedNetwork: UInt32
+    private let allowedMask: UInt32
     private var connections: [UUID: NWConnection] = [:]
 
     init(
-        bindAddress: String,
+        allowedIPv4Address: String,
+        prefixLength: Int,
         port: UInt16,
         onStateChange: @escaping @Sendable (Bool, String?) -> Void = { _, _ in },
         handler: @escaping @Sendable (HTTPRequest) async -> HTTPResponse
     ) throws {
         guard let nwPort = NWEndpoint.Port(rawValue: port) else { throw URLError(.badURL) }
+        guard let hostAddress = Self.ipv4Value(allowedIPv4Address), (0...32).contains(prefixLength) else {
+            throw ServerError.invalidPrivateNetwork
+        }
+        let mask = prefixLength == 0 ? 0 : UInt32.max << (32 - UInt32(prefixLength))
+        allowedMask = mask
+        allowedNetwork = hostAddress & mask
         self.handler = handler
 
-        let parameters = NWParameters.tcp
-        parameters.requiredLocalEndpoint = .hostPort(host: NWEndpoint.Host(bindAddress), port: nwPort)
-        listener = try NWListener(using: parameters)
+        listener = try NWListener(using: .tcp, on: nwPort)
         listener.stateUpdateHandler = { state in
             switch state {
             case .ready:
@@ -102,6 +120,11 @@ final class LocalHTTPServer: @unchecked Sendable {
     }
 
     private func accept(_ connection: NWConnection) {
+        guard isAllowedPrivatePeer(connection.endpoint) else {
+            Self.logger.warning("Conexión TCP cancelada fuera del CIDR privado")
+            connection.cancel()
+            return
+        }
         guard connections.count < Self.maximumConnections else {
             connection.cancel()
             return
@@ -152,6 +175,18 @@ final class LocalHTTPServer: @unchecked Sendable {
             return String(describing: host)
         }
         return "unknown"
+    }
+
+    private func isAllowedPrivatePeer(_ endpoint: NWEndpoint) -> Bool {
+        guard case .hostPort(let host, _) = endpoint,
+              let candidate = Self.ipv4Value(String(describing: host)) else { return false }
+        return candidate & allowedMask == allowedNetwork
+    }
+
+    private static func ipv4Value(_ value: String) -> UInt32? {
+        var address = in_addr()
+        guard value.withCString({ inet_pton(AF_INET, $0, &address) }) == 1 else { return nil }
+        return UInt32(bigEndian: address.s_addr)
     }
 
     private static func parse(_ data: Data, clientIdentifier: String) -> ParseResult {

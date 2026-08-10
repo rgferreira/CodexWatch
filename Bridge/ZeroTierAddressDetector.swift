@@ -2,6 +2,11 @@ import Foundation
 import Darwin
 
 enum ZeroTierAddressDetector {
+    struct IPv4Network {
+        let address: String
+        let prefixLength: Int
+    }
+
     enum DetectionError: LocalizedError {
         case commandUnavailable
         case noActiveIPv4Address
@@ -18,10 +23,11 @@ enum ZeroTierAddressDetector {
 
     private struct Network: Decodable {
         let status: String?
+        let portDeviceName: String?
         let assignedAddresses: [String]?
     }
 
-    static func activeIPv4Address() throws -> String {
+    static func activeIPv4Network() throws -> IPv4Network {
         let candidates = [
             "/usr/local/bin/zerotier-cli",
             "/opt/homebrew/bin/zerotier-cli",
@@ -35,9 +41,14 @@ enum ZeroTierAddressDetector {
             guard let output = run(executable) else { continue }
             guard let networks = try? JSONDecoder().decode([Network].self, from: output) else { continue }
             for network in networks where network.status == "OK" {
+                guard network.portDeviceName?.isEmpty == false else { continue }
                 for assignment in network.assignedAddresses ?? [] {
-                    let address = assignment.split(separator: "/", maxSplits: 1).first.map(String.init) ?? ""
-                    if isValidIPv4(address) { return address }
+                    let components = assignment.split(separator: "/", maxSplits: 1).map(String.init)
+                    guard components.count == 2,
+                          let prefixLength = Int(components[1]),
+                          (0...32).contains(prefixLength),
+                          isValidIPv4(components[0]) else { continue }
+                    return IPv4Network(address: components[0], prefixLength: prefixLength)
                 }
             }
         }

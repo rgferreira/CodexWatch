@@ -8,7 +8,7 @@ Aplicación experimental para seleccionar una tarea reciente de Codex desde el A
 - `CodexWatch Watch App`: selector cronológico, dictado, revisión y envío.
 - `CodexWatchBridge`: puente local autenticado que habla con `codex app-server`.
 
-El puente detecta la interfaz activa de ZeroTier, escucha en el puerto `48720` **solo en su dirección privada** y exige el token de acceso mostrado por la aplicación de macOS. No publica Bonjour ni abre un listener en Wi-Fi, Ethernet, loopback o todas las interfaces.
+El puente detecta la red IPv4 activa de ZeroTier y cancela antes de leer datos cualquier conexión cuyo origen no pertenezca a su CIDR privado. Exige el token de acceso mostrado por la aplicación de macOS y no publica Bonjour ni procesa HTTP desde Wi-Fi, Ethernet física o loopback.
 
 El icono de la barra de menús es verde solamente cuando tanto el servidor HTTP como `codex app-server` están disponibles; en cualquier otro estado es rojo. Los mensajes se cargan bajo demanda al abrir una tarea en el reloj, evitando sondear el historial de todas las tareas.
 
@@ -20,7 +20,7 @@ El servicio HTTP no debe exponerse directamente a Internet. ZeroTier cifra el tr
 
 ## Controles de seguridad
 
-- Bind exclusivo a la dirección IPv4 que comunica `zerotier-cli`; si ZeroTier no está activo, el servidor no se inicia.
+- Allowlist dinámica del CIDR que comunica `zerotier-cli`; si ZeroTier no está activo, el servidor no se inicia y cualquier origen ajeno se cancela antes de leer datos.
 - Token de 256 bits generado con `SecRandomCopyBytes`, almacenado en Keychain y comparado en tiempo constante.
 - Bloqueo temporal tras cinco intentos de autenticación fallidos por origen.
 - Máximo de 24 conexiones simultáneas y tiempo máximo de 30 segundos por conexión.

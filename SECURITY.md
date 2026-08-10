@@ -6,6 +6,8 @@ Codex Watch Bridge está diseñado para una red privada de ZeroTier. No debe pub
 
 El tráfico HTTP viaja dentro del transporte cifrado de ZeroTier. La autenticación mediante token es una defensa adicional, no un sustituto de la red privada. Todos los miembros autorizados en la misma red ZeroTier deben considerarse capaces de intentar conectar con el bridge.
 
+El socket puede aparecer como listener global en herramientas del sistema porque `Network.framework` no identifica de forma estable la interfaz virtual de ZeroTier cuando el tráfico llega desde redes móviles. El bridge cancela antes de leer datos cualquier conexión cuyo origen no pertenezca al CIDR asignado por ZeroTier; después aplica el token y el rate limiting.
+
 ## Datos sensibles
 
 - El repositorio no debe contener direcciones de red reales, tokens, identificadores de red ZeroTier ni datos exportados de conversaciones.

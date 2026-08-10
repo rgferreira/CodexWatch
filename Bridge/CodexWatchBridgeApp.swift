@@ -121,8 +121,8 @@ final class BridgeController: ObservableObject {
                 do {
                     try appServer.start()
                     if httpServer == nil {
-                        let address = try ZeroTierAddressDetector.activeIPv4Address()
-                        httpServer = try LocalHTTPServer(bindAddress: address, port: 48720, onStateChange: { [weak self] ready, error in
+                        let network = try ZeroTierAddressDetector.activeIPv4Network()
+                        httpServer = try LocalHTTPServer(allowedIPv4Address: network.address, prefixLength: network.prefixLength, port: 48720, onStateChange: { [weak self] ready, error in
                             Task { @MainActor [weak self] in
                                 guard let self else { return }
                                 isHTTPReady = ready
@@ -206,8 +206,10 @@ final class BridgeController: ObservableObject {
         case .authorized:
             return nil
         case .unauthorized:
+            Self.logger.warning("Solicitud privada rechazada por autenticación")
             return .unauthorized
         case .rateLimited:
+            Self.logger.warning("Origen privado bloqueado temporalmente por autenticación")
             return .rateLimited
         }
     }
