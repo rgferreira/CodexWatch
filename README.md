@@ -12,6 +12,8 @@ El puente detecta la red IPv4 activa de ZeroTier y cancela antes de leer datos c
 
 El icono de la barra de menús es verde solamente cuando tanto el servidor HTTP como `codex app-server` están disponibles; en cualquier otro estado es rojo. Los mensajes se cargan bajo demanda al abrir una tarea en el reloj, evitando sondear el historial de todas las tareas.
 
+La lista del Watch pide una copia fresca al abrirse y cada 10 segundos mientras permanece visible. La petición de WatchConnectivity despierta a la app compañera del iPhone, que consulta el bridge por ZeroTier y responde directamente al reloj; no depende del temporizador en primer plano de iOS. Fuera de la lista se conserva la última copia para no gastar batería innecesariamente.
+
 ## Fuera de casa
 
 Configura en la app del iPhone la URL privada del Mac, por ejemplo `http://<IP-PRIVADA>:48720`, y pega el token copiado desde el bridge. La dirección queda guardada únicamente en el dispositivo y no forma parte del código fuente. El token aleatorio de 256 bits se guarda en Keychain tanto en macOS como en iOS. Así puede alcanzar el puente desde otra red siempre que ZeroTier esté activo también en el iPhone. WatchConnectivity mantiene el Apple Watch desacoplado de este detalle: el reloj sigue hablando con el iPhone y el iPhone reenvía la orden por la red privada.

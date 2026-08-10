@@ -141,9 +141,12 @@ final class PhoneRelay: NSObject, ObservableObject {
         accessToken = (try? SecureTokenStore.load(service: Self.tokenService, account: Self.tokenAccount)) ?? ""
         UserDefaults.standard.removeObject(forKey: "pairingCode")
         super.init()
+        session?.delegate = self
+        session?.activate()
     }
 
     func start() {
+        // La activación temprana permite que WatchConnectivity despierte la app en segundo plano.
         if session?.delegate == nil {
             session?.delegate = self
             session?.activate()
@@ -274,6 +277,19 @@ extension PhoneRelay: WCSessionDelegate {
         replyHandler: @escaping ([String: Any]) -> Void
     ) {
         let reply = WatchReplyHandlerBox(replyHandler)
+        if message[CodexWatchWire.tasksRequest] as? Bool == true {
+            Task { @MainActor [weak self] in
+                guard let self else { reply.call([:]); return }
+                await refreshTasks()
+                guard isConnected,
+                      let data = try? CodexWatchWire.encode(tasks) else {
+                    reply.call([CodexWatchWire.tasksError: statusMessage])
+                    return
+                }
+                reply.call([CodexWatchWire.tasksResponse: data])
+            }
+            return
+        }
         guard let taskID = message[CodexWatchWire.conversationRequest] as? String else {
             reply.call([:])
             return

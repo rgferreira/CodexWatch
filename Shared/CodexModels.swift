@@ -63,6 +63,9 @@ struct CommandReceipt: Codable, Hashable, Sendable {
 
 enum CodexWatchWire {
     static let tasks = "codexwatch.tasks"
+    static let tasksRequest = "codexwatch.tasks.request"
+    static let tasksResponse = "codexwatch.tasks.response"
+    static let tasksError = "codexwatch.tasks.error"
     static let command = "codexwatch.command"
     static let conversationRequest = "codexwatch.conversation.request"
     static let conversationResponse = "codexwatch.conversation.response"

@@ -24,15 +24,26 @@ struct TaskPickerView: View {
         if relay.tasks.isEmpty {
           ContentUnavailableView(
             "Sin tareas", systemImage: "iphone.and.arrow.forward",
-            description: Text("Abre Codex Watch en el iPhone para sincronizar."))
+            description: Text(relay.taskRefreshError ?? "Actualizando desde Codex…"))
         } else {
-          List(relay.tasks.sorted { $0.updatedAt > $1.updatedAt }) { task in
-            NavigationLink(value: task) {
-              VStack(alignment: .leading, spacing: 3) {
-                Text(task.title).lineLimit(2)
-                Text(task.updatedAt, style: .relative)
-                  .font(.caption2)
-                  .foregroundStyle(.secondary)
+          List {
+            if let error = relay.taskRefreshError {
+              Label(error, systemImage: "exclamationmark.triangle")
+                .font(.caption2)
+                .foregroundStyle(.orange)
+            }
+            ForEach(relay.tasks.sorted { $0.updatedAt > $1.updatedAt }) { task in
+              NavigationLink(value: task) {
+                HStack(spacing: 6) {
+                  VStack(alignment: .leading, spacing: 3) {
+                    Text(task.title).lineLimit(2)
+                    Text(task.updatedAt, style: .relative)
+                      .font(.caption2)
+                      .foregroundStyle(.secondary)
+                  }
+                  Spacer(minLength: 2)
+                  TaskStateView(state: task.state)
+                }
               }
             }
           }
@@ -42,6 +53,40 @@ struct TaskPickerView: View {
       .navigationDestination(for: CodexTask.self) { task in
         VoiceCommandView(task: task)
       }
+      .toolbar {
+        ToolbarItem(placement: .topBarTrailing) {
+          if relay.isRefreshingTasks {
+            ProgressView()
+              .controlSize(.mini)
+          } else {
+            Button { relay.refreshTasks() } label: {
+              Image(systemName: "arrow.clockwise")
+            }
+            .accessibilityLabel("Actualizar tareas")
+          }
+        }
+      }
+    }
+    .task { await relay.refreshTasksContinuously() }
+  }
+}
+
+private struct TaskStateView: View {
+  let state: CodexTask.State
+
+  var body: some View {
+    switch state {
+    case .working:
+      ProgressView()
+        .controlSize(.mini)
+        .tint(.green)
+        .accessibilityLabel("Codex trabajando")
+    case .needsAttention:
+      Image(systemName: "exclamationmark.circle.fill")
+        .foregroundStyle(.orange)
+        .accessibilityLabel("Necesita atención")
+    case .idle, .unknown:
+      EmptyView()
     }
   }
 }
@@ -245,6 +290,8 @@ final class WatchRelay: NSObject, ObservableObject {
   @Published private(set) var conversations: [String: [CodexMessage]] = [:]
   @Published private(set) var loadingConversations: Set<String> = []
   @Published private(set) var conversationErrors: [String: String] = [:]
+  @Published private(set) var isRefreshingTasks = false
+  @Published private(set) var taskRefreshError: String?
 
   private let session: WCSession? = WCSession.isSupported() ? .default : nil
 
@@ -265,6 +312,34 @@ final class WatchRelay: NSObject, ObservableObject {
       }
     } else {
       session.transferUserInfo([CodexWatchWire.command: data])
+    }
+  }
+
+  func refreshTasks() {
+    guard !isRefreshingTasks else { return }
+    guard let session, session.activationState == .activated, session.isReachable else {
+      taskRefreshError = "iPhone no disponible"
+      return
+    }
+    isRefreshingTasks = true
+    taskRefreshError = nil
+    let replyHandler = WatchTasksReplyHandler()
+    session.sendMessage(
+      [CodexWatchWire.tasksRequest: true],
+      replyHandler: replyHandler.receive,
+      errorHandler: replyHandler.fail
+    )
+  }
+
+  func refreshTasksContinuously() async {
+    refreshTasks()
+    while !Task.isCancelled {
+      do {
+        try await Task.sleep(for: .seconds(10))
+      } catch {
+        return
+      }
+      refreshTasks()
     }
   }
 
@@ -295,6 +370,17 @@ final class WatchRelay: NSObject, ObservableObject {
     conversationErrors[taskID] = message
   }
 
+  fileprivate func finishTaskRefresh(_ data: Data) {
+    isRefreshingTasks = false
+    taskRefreshError = nil
+    applyTasks(data)
+  }
+
+  fileprivate func failTaskRefresh(_ message: String) {
+    isRefreshingTasks = false
+    taskRefreshError = message
+  }
+
   private func applyTasks(_ data: Data) {
     guard let decoded = try? CodexWatchWire.decode([CodexTask].self, from: data) else { return }
     tasks = decoded.sorted { $0.updatedAt > $1.updatedAt }
@@ -305,13 +391,36 @@ extension WatchRelay: WCSessionDelegate {
   nonisolated func session(
     _ session: WCSession, activationDidCompleteWith activationState: WCSessionActivationState,
     error: Error?
-  ) {}
+  ) {
+    guard activationState == .activated, error == nil else { return }
+    Task { @MainActor [weak self] in self?.refreshTasks() }
+  }
 
   nonisolated func session(
     _ session: WCSession, didReceiveApplicationContext applicationContext: [String: Any]
   ) {
     guard let data = applicationContext[CodexWatchWire.tasks] as? Data else { return }
     Task { @MainActor [weak self] in self?.applyTasks(data) }
+  }
+}
+
+private final class WatchTasksReplyHandler: @unchecked Sendable {
+  func receive(_ reply: [String: Any]) {
+    if let error = reply[CodexWatchWire.tasksError] as? String, !error.isEmpty {
+      Task { @MainActor in WatchRelay.shared.failTaskRefresh(error) }
+      return
+    }
+    guard let data = reply[CodexWatchWire.tasksResponse] as? Data, !data.isEmpty else {
+      Task { @MainActor in
+        WatchRelay.shared.failTaskRefresh("No se pudieron actualizar las tareas")
+      }
+      return
+    }
+    Task { @MainActor in WatchRelay.shared.finishTaskRefresh(data) }
+  }
+
+  func fail(_ error: Error) {
+    Task { @MainActor in WatchRelay.shared.failTaskRefresh("iPhone no disponible") }
   }
 }
 
