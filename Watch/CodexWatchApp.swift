@@ -17,6 +17,7 @@ struct CodexWatchApp: App {
 
 struct TaskPickerView: View {
   @EnvironmentObject private var relay: WatchRelay
+  @State private var isCreatingTask = false
 
   var body: some View {
     NavigationStack {
@@ -53,7 +54,16 @@ struct TaskPickerView: View {
       .navigationDestination(for: CodexTask.self) { task in
         VoiceCommandView(task: task)
       }
+      .navigationDestination(isPresented: $isCreatingTask) {
+        NewTaskView()
+      }
       .toolbar {
+        ToolbarItem(placement: .topBarLeading) {
+          Button { isCreatingTask = true } label: {
+            Image(systemName: "plus")
+          }
+          .accessibilityLabel("Crear nueva tarea")
+        }
         ToolbarItem(placement: .topBarTrailing) {
           if relay.isRefreshingTasks {
             ProgressView()
@@ -68,6 +78,112 @@ struct TaskPickerView: View {
       }
     }
     .task { await relay.refreshTasksContinuously() }
+  }
+}
+
+private struct NewTaskView: View {
+  @EnvironmentObject private var relay: WatchRelay
+  @Environment(\.dismiss) private var dismiss
+
+  @State private var prompt = ""
+  @State private var selectedProjectPath = ""
+  @State private var commandID: UUID?
+
+  private var projectPaths: [String] {
+    relay.tasks
+      .sorted { $0.updatedAt > $1.updatedAt }
+      .compactMap(\.projectPath)
+      .reduce(into: [String]()) { paths, path in
+        if !path.isEmpty, !paths.contains(path) { paths.append(path) }
+      }
+  }
+
+  private var receipt: CommandReceipt? {
+    guard let commandID else { return nil }
+    return relay.commandReceipts[commandID]
+  }
+
+  var body: some View {
+    ScrollView {
+      VStack(alignment: .leading, spacing: 10) {
+        if !projectPaths.isEmpty {
+          Picker("Proyecto", selection: $selectedProjectPath) {
+            Text("Sin proyecto").tag("")
+            ForEach(projectPaths, id: \.self) { path in
+              Text(URL(fileURLWithPath: path).lastPathComponent).tag(path)
+            }
+          }
+        }
+
+        TextFieldLink(prompt: Text("Describe la nueva tarea")) {
+          Label(prompt.isEmpty ? "Dictar petición" : "Volver a dictar", systemImage: "mic.fill")
+        } onSubmit: {
+          prompt = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        .buttonStyle(.borderedProminent)
+
+        if !prompt.isEmpty {
+          Text(prompt)
+            .font(.body)
+            .padding(8)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+
+          Button("Crear tarea") {
+            let projectPath = selectedProjectPath.isEmpty ? nil : selectedProjectPath
+            commandID = relay.createTask(
+              NewTaskCommand(prompt: prompt, projectPath: projectPath)
+            )
+            WKInterfaceDevice.current().play(.click)
+          }
+          .tint(.green)
+          .disabled(receipt?.state == .queued)
+        }
+
+        if let receipt {
+          switch receipt.state {
+          case .queued:
+            HStack {
+              ProgressView()
+              Text(receipt.message).font(.caption2)
+            }
+          case .sent:
+            Label(receipt.message, systemImage: "checkmark.circle.fill")
+              .font(.caption)
+              .foregroundStyle(.green)
+          case .failed:
+            Label(receipt.message, systemImage: "xmark.circle.fill")
+              .font(.caption2)
+              .foregroundStyle(.red)
+          }
+        }
+      }
+    }
+    .navigationTitle("Nueva tarea")
+    .onAppear {
+      if selectedProjectPath.isEmpty { selectedProjectPath = projectPaths.first ?? "" }
+    }
+    .task(id: commandID) {
+      guard let commandID else { return }
+      while !Task.isCancelled,
+        relay.commandReceipts[commandID]?.state == .queued
+      {
+        relay.refreshReceipt(commandID)
+        do {
+          try await Task.sleep(for: .seconds(3))
+        } catch {
+          return
+        }
+      }
+    }
+    .onChange(of: receipt?.state) { _, state in
+      guard state == .sent else { return }
+      WKInterfaceDevice.current().play(.success)
+      relay.refreshTasks()
+      Task {
+        try? await Task.sleep(for: .seconds(1.2))
+        dismiss()
+      }
+    }
   }
 }
 
@@ -103,6 +219,7 @@ struct VoiceCommandView: View {
   @StateObject private var recorder = WatchVoiceRecorder()
   @State private var commandID: UUID?
   @State private var transcript = ""
+  @State private var hasPositionedInitialMessages = false
 
   private var recentMessages: [CodexMessage] {
     relay.conversations[task.id] ?? []
@@ -121,20 +238,22 @@ struct VoiceCommandView: View {
             .font(.caption.bold())
             .foregroundStyle(.secondary)
 
-          if relay.loadingConversations.contains(task.id) {
-            HStack {
-              Spacer()
-              ProgressView()
-              Spacer()
+          if recentMessages.isEmpty {
+            if relay.loadingConversations.contains(task.id) {
+              HStack {
+                Spacer()
+                ProgressView()
+                Spacer()
+              }
+            } else if let error = relay.conversationErrors[task.id] {
+              Label(error, systemImage: "exclamationmark.triangle")
+                .font(.caption2)
+                .foregroundStyle(.orange)
+            } else {
+              Text("No hay mensajes disponibles")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
             }
-          } else if let error = relay.conversationErrors[task.id] {
-            Label(error, systemImage: "exclamationmark.triangle")
-              .font(.caption2)
-              .foregroundStyle(.orange)
-          } else if recentMessages.isEmpty {
-            Text("No hay mensajes disponibles")
-              .font(.caption2)
-              .foregroundStyle(.secondary)
           } else {
             LazyVStack(alignment: .leading, spacing: 7) {
               ForEach(recentMessages) { message in
@@ -154,11 +273,13 @@ struct VoiceCommandView: View {
       }
       .onAppear {
         if !recentMessages.isEmpty {
+          hasPositionedInitialMessages = true
           proxy.scrollTo(ScrollAnchor.composer, anchor: .bottom)
         }
       }
       .onChange(of: recentMessages.count) { _, count in
-        guard count > 0 else { return }
+        guard count > 0, !hasPositionedInitialMessages else { return }
+        hasPositionedInitialMessages = true
         withAnimation(.easeOut(duration: 0.25)) {
           proxy.scrollTo(ScrollAnchor.composer, anchor: .bottom)
         }
@@ -171,7 +292,12 @@ struct VoiceCommandView: View {
           .frame(width: 120, height: 24)
       }
     }
-    .task { relay.loadConversation(for: task.id) }
+    .task(id: relay.updatedAt(for: task.id, fallback: task.updatedAt)) {
+      relay.loadConversationIfNeeded(
+        for: task.id,
+        updatedAt: relay.updatedAt(for: task.id, fallback: task.updatedAt)
+      )
+    }
     .task(id: commandID) {
       guard let commandID else { return }
       while !Task.isCancelled,
@@ -403,6 +529,11 @@ private struct ConversationMessageView: View {
   }
 }
 
+private struct CachedConversation: Codable {
+  let messages: [CodexMessage]
+  let updatedAt: Date
+}
+
 @MainActor
 final class WatchRelay: NSObject, ObservableObject {
   static let shared = WatchRelay()
@@ -418,13 +549,28 @@ final class WatchRelay: NSObject, ObservableObject {
 
   private let session: WCSession? = WCSession.isSupported() ? .default : nil
   private var lastQueuedTaskRequest: Date?
+  private var latestTasksRevision = UserDefaults.standard.double(forKey: "latestTasksRevision")
+  private var conversationRevisions: [String: Date] = [:]
+  private static let cachedConversationsKey = "cachedConversations"
+
+  private override init() {
+    super.init()
+    guard let data = UserDefaults.standard.data(forKey: Self.cachedConversationsKey),
+      let cached = try? CodexWatchWire.decode([String: CachedConversation].self, from: data)
+    else { return }
+    conversations = cached.mapValues(\.messages)
+    conversationRevisions = cached.mapValues(\.updatedAt)
+  }
 
   func start() {
     guard session?.delegate == nil else { return }
     session?.delegate = self
     session?.activate()
     if let data = session?.receivedApplicationContext[CodexWatchWire.tasks] as? Data {
-      applyTasks(data)
+      applyTasks(
+        data,
+        revision: session?.receivedApplicationContext[CodexWatchWire.tasksRevision] as? TimeInterval
+      )
     }
     applyVoiceSettings(
       inputModeRawValue: session?.receivedApplicationContext[CodexWatchWire.voiceInputMode] as? String,
@@ -461,6 +607,45 @@ final class WatchRelay: NSObject, ObservableObject {
       )
     } else {
       session.transferUserInfo([CodexWatchWire.command: data])
+      commandReceipts[command.id] = CommandReceipt(
+        commandID: command.id,
+        state: .queued,
+        message: "Pendiente de que responda el iPhone…"
+      )
+    }
+    return command.id
+  }
+
+  func createTask(_ command: NewTaskCommand) -> UUID {
+    commandReceipts[command.id] = CommandReceipt(
+      commandID: command.id,
+      state: .queued,
+      message: "Creando en Codex…"
+    )
+    guard let data = try? CodexWatchWire.encode(command),
+          let session,
+          session.activationState == .activated else {
+      commandReceipts[command.id] = CommandReceipt(
+        commandID: command.id,
+        state: .failed,
+        message: "El Watch no está conectado con el iPhone"
+      )
+      return command.id
+    }
+    if session.isReachable {
+      let replyHandler = WatchCommandReplyHandler(
+        commandID: command.id,
+        commandData: data,
+        messageKey: CodexWatchWire.newTaskCommand,
+        session: session
+      )
+      session.sendMessage(
+        [CodexWatchWire.newTaskCommand: data],
+        replyHandler: replyHandler.receive,
+        errorHandler: replyHandler.fail
+      )
+    } else {
+      session.transferUserInfo([CodexWatchWire.newTaskCommand: data])
       commandReceipts[command.id] = CommandReceipt(
         commandID: command.id,
         state: .queued,
@@ -536,15 +721,22 @@ final class WatchRelay: NSObject, ObservableObject {
     }
   }
 
-  func loadConversation(for taskID: String) {
-    guard conversations[taskID] == nil, !loadingConversations.contains(taskID) else { return }
+  func updatedAt(for taskID: String, fallback: Date) -> Date {
+    tasks.first(where: { $0.id == taskID })?.updatedAt ?? fallback
+  }
+
+  func loadConversationIfNeeded(for taskID: String, updatedAt revision: Date) {
+    if let loadedRevision = conversationRevisions[taskID], loadedRevision >= revision { return }
+    guard !loadingConversations.contains(taskID) else { return }
     guard let session, session.isReachable else {
-      conversationErrors[taskID] = "Abre Codex Watch en el iPhone"
+      if conversations[taskID]?.isEmpty != false {
+        conversationErrors[taskID] = "Abre Codex Watch en el iPhone"
+      }
       return
     }
     loadingConversations.insert(taskID)
     conversationErrors[taskID] = nil
-    let replyHandler = WatchConversationReplyHandler(taskID: taskID)
+    let replyHandler = WatchConversationReplyHandler(taskID: taskID, revision: revision)
     session.sendMessage(
       [CodexWatchWire.conversationRequest: taskID],
       replyHandler: replyHandler.receive,
@@ -552,10 +744,21 @@ final class WatchRelay: NSObject, ObservableObject {
     )
   }
 
-  fileprivate func finishConversation(_ conversation: CodexConversation, for taskID: String) {
+  fileprivate func finishConversation(
+    _ conversation: CodexConversation,
+    for taskID: String,
+    revision: Date
+  ) {
     loadingConversations.remove(taskID)
     conversationErrors[taskID] = nil
     conversations[taskID] = conversation.messages
+    conversationRevisions[taskID] = revision
+    persistConversations()
+
+    let newestRevision = updatedAt(for: taskID, fallback: revision)
+    if newestRevision > revision {
+      loadConversationIfNeeded(for: taskID, updatedAt: newestRevision)
+    }
   }
 
   fileprivate func failConversation(for taskID: String, message: String) {
@@ -563,10 +766,10 @@ final class WatchRelay: NSObject, ObservableObject {
     conversationErrors[taskID] = message
   }
 
-  fileprivate func finishTaskRefresh(_ data: Data) {
+  fileprivate func finishTaskRefresh(_ data: Data, revision: TimeInterval?) {
     isRefreshingTasks = false
     taskRefreshError = nil
-    applyTasks(data)
+    applyTasks(data, revision: revision)
   }
 
   fileprivate func applyCommandReceipt(_ data: Data) {
@@ -583,12 +786,39 @@ final class WatchRelay: NSObject, ObservableObject {
     taskRefreshError = message
   }
 
-  private func applyTasks(_ data: Data) {
+  private func applyTasks(_ data: Data, revision: TimeInterval?) {
+    if let revision {
+      guard revision >= latestTasksRevision else { return }
+      latestTasksRevision = revision
+      UserDefaults.standard.set(revision, forKey: "latestTasksRevision")
+    } else if latestTasksRevision > 0 {
+      return
+    }
     guard let decoded = try? CodexWatchWire.decode([CodexTask].self, from: data) else { return }
     tasks = decoded.sorted { $0.updatedAt > $1.updatedAt }
     isRefreshingTasks = false
     taskRefreshError = nil
     lastQueuedTaskRequest = nil
+
+    if let mostRecentTask = tasks.first {
+      loadConversationIfNeeded(
+        for: mostRecentTask.id,
+        updatedAt: mostRecentTask.updatedAt
+      )
+    }
+  }
+
+  private func persistConversations() {
+    var cached: [String: CachedConversation] = [:]
+    for (taskID, revision) in conversationRevisions
+      .sorted(by: { $0.value > $1.value })
+      .prefix(12)
+    {
+      guard let messages = conversations[taskID] else { continue }
+      cached[taskID] = CachedConversation(messages: messages, updatedAt: revision)
+    }
+    guard let data = try? CodexWatchWire.encode(cached) else { return }
+    UserDefaults.standard.set(data, forKey: Self.cachedConversationsKey)
   }
 
   private func applyVoiceSettings(inputModeRawValue: String?, modelRawValue: String?) {
@@ -614,26 +844,39 @@ extension WatchRelay: WCSessionDelegate {
     _ session: WCSession, didReceiveApplicationContext applicationContext: [String: Any]
   ) {
     let tasksData = applicationContext[CodexWatchWire.tasks] as? Data
+    let tasksRevision = applicationContext[CodexWatchWire.tasksRevision] as? TimeInterval
     let inputMode = applicationContext[CodexWatchWire.voiceInputMode] as? String
     let transcriptionModel = applicationContext[CodexWatchWire.transcriptionModel] as? String
     Task { @MainActor [weak self] in
-      if let tasksData { self?.applyTasks(tasksData) }
+      if let tasksData { self?.applyTasks(tasksData, revision: tasksRevision) }
       self?.applyVoiceSettings(inputModeRawValue: inputMode, modelRawValue: transcriptionModel)
     }
   }
 
   nonisolated func session(_ session: WCSession, didReceiveMessage message: [String: Any]) {
     let tasksData = message[CodexWatchWire.tasksResponse] as? Data
+    let tasksRevision = message[CodexWatchWire.tasksRevision] as? TimeInterval
     let receiptData = message[CodexWatchWire.commandReceipt] as? Data
     Task { @MainActor [weak self] in
-      if let tasksData { self?.applyTasks(tasksData) }
+      if let tasksData { self?.applyTasks(tasksData, revision: tasksRevision) }
       if let receiptData { self?.applyCommandReceipt(receiptData) }
     }
   }
 
   nonisolated func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
-    guard let data = userInfo[CodexWatchWire.commandReceipt] as? Data else { return }
-    Task { @MainActor [weak self] in self?.applyCommandReceipt(data) }
+    let tasksData = userInfo[CodexWatchWire.tasksResponse] as? Data
+    let tasksRevision = userInfo[CodexWatchWire.tasksRevision] as? TimeInterval
+    let inputMode = userInfo[CodexWatchWire.voiceInputMode] as? String
+    let transcriptionModel = userInfo[CodexWatchWire.transcriptionModel] as? String
+    let receiptData = userInfo[CodexWatchWire.commandReceipt] as? Data
+    Task { @MainActor [weak self] in
+      if let tasksData { self?.applyTasks(tasksData, revision: tasksRevision) }
+      self?.applyVoiceSettings(
+        inputModeRawValue: inputMode,
+        modelRawValue: transcriptionModel
+      )
+      if let receiptData { self?.applyCommandReceipt(receiptData) }
+    }
   }
 
   nonisolated func sessionReachabilityDidChange(_ session: WCSession) {
@@ -674,7 +917,8 @@ private final class WatchTasksReplyHandler: @unchecked Sendable {
       }
       return
     }
-    Task { @MainActor in WatchRelay.shared.finishTaskRefresh(data) }
+    let revision = reply[CodexWatchWire.tasksRevision] as? TimeInterval
+    Task { @MainActor in WatchRelay.shared.finishTaskRefresh(data, revision: revision) }
   }
 
   func fail(_ error: Error) {
@@ -701,9 +945,11 @@ private final class WatchReceiptReplyHandler: @unchecked Sendable {
 
 private final class WatchConversationReplyHandler: @unchecked Sendable {
   private let taskID: String
+  private let revision: Date
 
-  init(taskID: String) {
+  init(taskID: String, revision: Date) {
     self.taskID = taskID
+    self.revision = revision
   }
 
   func receive(_ reply: [String: Any]) {
@@ -723,8 +969,12 @@ private final class WatchConversationReplyHandler: @unchecked Sendable {
       }
       return
     }
-    Task { @MainActor [taskID] in
-      WatchRelay.shared.finishConversation(conversation, for: taskID)
+    Task { @MainActor [taskID, revision] in
+      WatchRelay.shared.finishConversation(
+        conversation,
+        for: taskID,
+        revision: revision
+      )
     }
   }
 
@@ -738,11 +988,18 @@ private final class WatchConversationReplyHandler: @unchecked Sendable {
 private final class WatchCommandReplyHandler: @unchecked Sendable {
   private let commandID: UUID
   private let commandData: Data
+  private let messageKey: String
   private let session: WCSession
 
-  init(commandID: UUID, commandData: Data, session: WCSession) {
+  init(
+    commandID: UUID,
+    commandData: Data,
+    messageKey: String = CodexWatchWire.command,
+    session: WCSession
+  ) {
     self.commandID = commandID
     self.commandData = commandData
+    self.messageKey = messageKey
     self.session = session
   }
 
@@ -761,7 +1018,7 @@ private final class WatchCommandReplyHandler: @unchecked Sendable {
   }
 
   func fail(_ error: Error) {
-    session.transferUserInfo([CodexWatchWire.command: commandData])
+    session.transferUserInfo([messageKey: commandData])
     Task { @MainActor [commandID] in
       WatchRelay.shared.setCommandReceipt(CommandReceipt(
         commandID: commandID,

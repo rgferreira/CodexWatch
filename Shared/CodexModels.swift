@@ -57,6 +57,20 @@ struct CodexCommand: Codable, Identifiable, Hashable, Sendable {
     }
 }
 
+struct NewTaskCommand: Codable, Identifiable, Hashable, Sendable {
+    let id: UUID
+    let prompt: String
+    let projectPath: String?
+    let createdAt: Date
+
+    init(prompt: String, projectPath: String?) {
+        id = UUID()
+        self.prompt = prompt
+        self.projectPath = projectPath
+        createdAt = Date()
+    }
+}
+
 enum VoiceInputMode: String, Codable, CaseIterable, Identifiable, Sendable {
     case watchDictation
     case openAIAPI
@@ -146,7 +160,9 @@ enum CodexWatchWire {
     static let tasksRequest = "codexwatch.tasks.request"
     static let tasksResponse = "codexwatch.tasks.response"
     static let tasksError = "codexwatch.tasks.error"
+    static let tasksRevision = "codexwatch.tasks.revision"
     static let command = "codexwatch.command"
+    static let newTaskCommand = "codexwatch.task.create"
     static let commandReceipt = "codexwatch.command.receipt"
     static let commandReceiptRequest = "codexwatch.command.receipt.request"
     static let voiceCommand = "codexwatch.voice.command"

@@ -10,9 +10,11 @@ Aplicación experimental para seleccionar una tarea reciente de Codex desde el A
 
 El puente acepta conexiones procedentes de redes privadas, loopback y, cuando está disponible, del CIDR detectado de ZeroTier. Exige el token de acceso mostrado por la aplicación de macOS y no publica Bonjour.
 
-El icono de la barra de menús es verde solamente cuando tanto el servidor HTTP como `codex app-server` están disponibles; en cualquier otro estado es rojo. Los mensajes se cargan bajo demanda al abrir una tarea en el reloj, evitando sondear el historial de todas las tareas.
+El icono de la barra de menús es verde solamente cuando tanto el servidor HTTP como `codex app-server` están disponibles; en cualquier otro estado es rojo. El reloj conserva localmente los últimos mensajes de las conversaciones consultadas y los muestra inmediatamente al abrir una tarea. Solo vuelve a solicitar una conversación cuando la marca `updatedAt` de la lista anuncia información nueva; la actualización ocurre en segundo plano sin ocultar los mensajes ni alterar la posición de lectura.
 
-La lista del Watch pide una copia fresca al abrirse y cada 10 segundos mientras permanece visible. La petición de WatchConnectivity despierta a la app compañera del iPhone, que consulta el bridge y responde directamente al reloj; además, el iPhone actualiza su copia cada 15 segundos mientras la app puede ejecutarse. Fuera de la lista se conserva la última copia para no gastar batería innecesariamente.
+La lista del Watch pide una copia fresca al abrirse y cada 10 segundos mientras permanece visible. La petición de WatchConnectivity despierta a la app compañera del iPhone, que consulta el bridge y responde directamente al reloj; además, el iPhone actualiza su copia cada 15 segundos mientras la app puede ejecutarse. Cada cambio se envía también como instantánea persistente, versionada y deduplicada: el reloj recibe la lista más nueva aunque el mensaje inmediato falle y descarta entregas antiguas. El iPhone conserva la última lista válida para no borrar el reloj con una caché vacía al reactivarse en segundo plano.
+
+El icono `+` de la esquina superior de la lista permite crear una tarea nueva. El reloj propone el proyecto de la tarea más reciente, permite elegir otro proyecto o ninguno, recoge la petición mediante dictado y envía al bridge un `thread/start` seguido del primer `turn/start`.
 
 ## Órdenes de voz
 
@@ -23,7 +25,7 @@ La app compañera ofrece dos rutas:
 
 El Companion permite seleccionar cualquiera de los seis modelos de transcripción de ficheros admitidos: `gpt-transcribe`, `gpt-4o-transcribe`, `gpt-4o-mini-transcribe`, `gpt-4o-mini-transcribe-2025-12-15`, `gpt-4o-transcribe-diarize` y `whisper-1`. La API key se configura en Codex Watch Bridge y se guarda únicamente en el llavero del Mac.
 
-Si Codex Desktop ya es propietario de la tarea seleccionada, el bridge entrega la orden al proceso propietario mediante el canal IPC local y privado de Codex. Así evita crear un segundo escritor, no repite la transcripción ni su facturación y devuelve al Watch una confirmación final en vez de dejar la orden indefinidamente en cola.
+Si Codex Desktop ya es propietario de la tarea seleccionada, el bridge entrega la orden al proceso propietario mediante el canal IPC local y privado de Codex. Si la tarea todavía no está activa en Desktop, el bridge la abre por su enlace `codex://`, espera brevemente a que registre su propietario y entrega entonces la orden con un identificador idempotente. El Watch solo muestra éxito cuando Codex acepta el turno y muestra un error final, en vez de una espera indefinida, si Desktop no logra activarlo.
 
 ## Fuera de casa
 

@@ -238,8 +238,15 @@ final class PhoneRelay: NSObject, ObservableObject {
     private var pollingTask: Task<Void, Never>?
     private var receiptPollingTasks: [UUID: Task<Void, Never>] = [:]
     private var activeBridgeURL: String?
+    private var tasksRevision: TimeInterval = 0
+    private var hasLoadedTasks = false
+    private var lastDurableTasksData: Data?
+    private var lastDurableVoiceInputMode: String?
+    private var lastDurableTranscriptionModel: String?
     private static let tokenService = "com.rgferreira.CodexWatch"
     private static let tokenAccount = "bridge-access-token"
+    private static let cachedTasksKey = "cachedTasks"
+    private static let cachedTasksRevisionKey = "cachedTasksRevision"
 
     private override init() {
         let defaults = UserDefaults.standard
@@ -259,6 +266,12 @@ final class PhoneRelay: NSObject, ObservableObject {
         transcriptionModel = OpenAITranscriptionModel(
             rawValue: defaults.string(forKey: "transcriptionModel") ?? ""
         ) ?? .gptTranscribe
+        if let cachedData = defaults.data(forKey: Self.cachedTasksKey),
+           let cachedTasks = try? CodexWatchWire.decode([CodexTask].self, from: cachedData) {
+            tasks = cachedTasks.sorted { $0.updatedAt > $1.updatedAt }
+            tasksRevision = defaults.double(forKey: Self.cachedTasksRevisionKey)
+            hasLoadedTasks = true
+        }
         defaults.removeObject(forKey: "pairingCode")
         super.init()
         session?.delegate = self
@@ -339,6 +352,12 @@ final class PhoneRelay: NSObject, ObservableObject {
             }
             guard let received else { throw lastError ?? URLError(.cannotConnectToHost) }
             tasks = received.sorted { $0.updatedAt > $1.updatedAt }
+            tasksRevision = Date().timeIntervalSince1970
+            hasLoadedTasks = true
+            if let data = try? CodexWatchWire.encode(tasks) {
+                UserDefaults.standard.set(data, forKey: Self.cachedTasksKey)
+                UserDefaults.standard.set(tasksRevision, forKey: Self.cachedTasksRevisionKey)
+            }
             statusMessage = "Conectado al Mac · \(tasks.count) tareas"
             isConnected = true
             pushTasksToWatch()
@@ -362,15 +381,37 @@ final class PhoneRelay: NSObject, ObservableObject {
     }
 
     private func pushTasksToWatch() {
-        guard let data = try? CodexWatchWire.encode(tasks) else { return }
+        guard hasLoadedTasks,
+              let session,
+              session.activationState == .activated,
+              let data = try? CodexWatchWire.encode(tasks) else { return }
         let context: [String: Any] = [
             CodexWatchWire.tasks: data,
+            CodexWatchWire.tasksRevision: tasksRevision,
             CodexWatchWire.voiceInputMode: voiceInputMode.rawValue,
             CodexWatchWire.transcriptionModel: transcriptionModel.rawValue
         ]
-        try? session?.updateApplicationContext(context)
-        if session?.isReachable == true {
-            session?.sendMessage([CodexWatchWire.tasksResponse: data], replyHandler: nil)
+        try? session.updateApplicationContext(context)
+        if session.isReachable {
+            session.sendMessage([
+                CodexWatchWire.tasksResponse: data,
+                CodexWatchWire.tasksRevision: tasksRevision
+            ], replyHandler: nil)
+        }
+        let mode = voiceInputMode.rawValue
+        let model = transcriptionModel.rawValue
+        if lastDurableTasksData != data
+            || lastDurableVoiceInputMode != mode
+            || lastDurableTranscriptionModel != model {
+            session.transferUserInfo([
+                CodexWatchWire.tasksResponse: data,
+                CodexWatchWire.tasksRevision: tasksRevision,
+                CodexWatchWire.voiceInputMode: mode,
+                CodexWatchWire.transcriptionModel: model
+            ])
+            lastDurableTasksData = data
+            lastDurableVoiceInputMode = mode
+            lastDurableTranscriptionModel = model
         }
     }
 
@@ -413,6 +454,29 @@ final class PhoneRelay: NSObject, ObservableObject {
                 commandID: command.id,
                 state: .failed,
                 message: "No se pudo enviar: \(Self.describe(error))"
+            )
+            statusMessage = receipt.message
+            isConnected = false
+            return receipt
+        }
+    }
+
+    private func submitNewTask(_ command: NewTaskCommand) async -> CommandReceipt {
+        do {
+            guard let baseURL = activeBridgeURL ?? configuredBridgeURL else {
+                throw URLError(.badURL)
+            }
+            let receipt = try await MacBridgeClient(baseURL: baseURL, token: accessToken)
+                .createTask(command)
+            statusMessage = receipt.state == .sent ? "Tarea creada" : receipt.message
+            isConnected = true
+            if receipt.state == .sent { await refreshTasks() }
+            return receipt
+        } catch {
+            let receipt = CommandReceipt(
+                commandID: command.id,
+                state: .failed,
+                message: "No se pudo crear: \(Self.describe(error))"
             )
             statusMessage = receipt.message
             isConnected = false
@@ -516,7 +580,20 @@ final class PhoneRelay: NSObject, ObservableObject {
 extension PhoneRelay: WCSessionDelegate {
     nonisolated func session(_ session: WCSession, activationDidCompleteWith activationState: WCSessionActivationState, error: Error?) {
         guard activationState == .activated, error == nil else { return }
-        Task { @MainActor [weak self] in self?.pushTasksToWatch() }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let backgroundTask = UIApplication.shared.beginBackgroundTask(
+                withName: "CodexWatch activation refresh",
+                expirationHandler: nil
+            )
+            defer {
+                if backgroundTask != .invalid {
+                    UIApplication.shared.endBackgroundTask(backgroundTask)
+                }
+            }
+            pushTasksToWatch()
+            await refreshTasks()
+        }
     }
     nonisolated func sessionDidBecomeInactive(_ session: WCSession) {}
     nonisolated func sessionDidDeactivate(_ session: WCSession) { session.activate() }
@@ -531,6 +608,10 @@ extension PhoneRelay: WCSessionDelegate {
         replyHandler: @escaping ([String: Any]) -> Void
     ) {
         let reply = WatchReplyHandlerBox(replyHandler)
+        if let commandData = message[CodexWatchWire.newTaskCommand] as? Data {
+            receiveNewTask(commandData, reply: reply)
+            return
+        }
         if let commandData = message[CodexWatchWire.command] as? Data {
             receiveCommand(commandData, reply: reply)
             return
@@ -572,7 +653,10 @@ extension PhoneRelay: WCSessionDelegate {
                     reply.call([CodexWatchWire.tasksError: statusMessage])
                     return
                 }
-                reply.call([CodexWatchWire.tasksResponse: data])
+                reply.call([
+                    CodexWatchWire.tasksResponse: data,
+                    CodexWatchWire.tasksRevision: tasksRevision
+                ])
             }
             return
         }
@@ -593,13 +677,27 @@ extension PhoneRelay: WCSessionDelegate {
     }
 
     nonisolated func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
+        if let data = userInfo[CodexWatchWire.newTaskCommand] as? Data {
+            receiveNewTask(data)
+            return
+        }
         if let data = userInfo[CodexWatchWire.command] as? Data {
             receiveCommand(data)
             return
         }
         if userInfo[CodexWatchWire.tasksRequest] as? Bool == true {
             Task { @MainActor [weak self] in
-                await self?.refreshTasks()
+                guard let self else { return }
+                let backgroundTask = UIApplication.shared.beginBackgroundTask(
+                    withName: "CodexWatch task refresh",
+                    expirationHandler: nil
+                )
+                defer {
+                    if backgroundTask != .invalid {
+                        UIApplication.shared.endBackgroundTask(backgroundTask)
+                    }
+                }
+                await refreshTasks()
             }
         }
     }
@@ -634,7 +732,9 @@ extension PhoneRelay: WCSessionDelegate {
     nonisolated func sessionReachabilityDidChange(_ session: WCSession) {
         guard session.isReachable else { return }
         Task { @MainActor [weak self] in
-            self?.pushTasksToWatch()
+            guard let self else { return }
+            pushTasksToWatch()
+            await refreshTasks()
         }
     }
 
@@ -652,6 +752,32 @@ extension PhoneRelay: WCSessionDelegate {
                 return
             }
             let receipt = await submit(command)
+            guard let receiptData = try? CodexWatchWire.encode(receipt) else {
+                reply?.call([:])
+                return
+            }
+            if let reply {
+                reply.call([CodexWatchWire.commandReceipt: receiptData])
+            } else {
+                sendReceiptToWatch(receipt)
+            }
+        }
+    }
+
+    private nonisolated func receiveNewTask(
+        _ data: Data,
+        reply: WatchReplyHandlerBox? = nil
+    ) {
+        guard let command = try? CodexWatchWire.decode(NewTaskCommand.self, from: data) else {
+            reply?.call([:])
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self else {
+                reply?.call([:])
+                return
+            }
+            let receipt = await submitNewTask(command)
             guard let receiptData = try? CodexWatchWire.encode(receipt) else {
                 reply?.call([:])
                 return
@@ -707,6 +833,17 @@ private struct MacBridgeClient: Sendable {
     func submit(_ command: CodexCommand) async throws -> CommandReceipt {
         var request = try request(path: "/commands")
         request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try CodexWatchWire.encode(command)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validate(response, data: data)
+        return try CodexWatchWire.decode(CommandReceipt.self, from: data)
+    }
+
+    func createTask(_ command: NewTaskCommand) async throws -> CommandReceipt {
+        var request = try request(path: "/tasks")
+        request.httpMethod = "POST"
+        request.timeoutInterval = 30
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try CodexWatchWire.encode(command)
         let (data, response) = try await URLSession.shared.data(for: request)

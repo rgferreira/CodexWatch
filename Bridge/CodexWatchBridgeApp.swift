@@ -250,6 +250,40 @@ final class BridgeController: ObservableObject {
         case ("GET", "/tasks"):
             await refreshTasks()
             return .encodable(tasks)
+        case ("POST", "/tasks"):
+            guard let command = try? CodexWatchWire.decode(NewTaskCommand.self, from: request.body) else {
+                return .badRequest
+            }
+            do {
+                if let existing = commandReceipts[command.id] { return .encodable(existing) }
+                if let projectPath = command.projectPath,
+                   !projectPath.isEmpty,
+                   !tasks.contains(where: { $0.projectPath == projectPath }) {
+                    throw NSError(
+                        domain: "CodexWatch",
+                        code: 4,
+                        userInfo: [NSLocalizedDescriptionKey: "El proyecto seleccionado ya no está disponible"]
+                    )
+                }
+                _ = try await appServer.createTask(command)
+                let receipt = CommandReceipt(
+                    commandID: command.id,
+                    state: .sent,
+                    message: "Tarea creada"
+                )
+                remember(receipt)
+                await refreshTasks()
+                return .encodable(receipt)
+            } catch {
+                Self.logger.error("No se pudo crear una tarea: \(error.localizedDescription, privacy: .private)")
+                let receipt = CommandReceipt(
+                    commandID: command.id,
+                    state: .failed,
+                    message: error.localizedDescription
+                )
+                remember(receipt)
+                return .encodable(receipt)
+            }
         case ("POST", "/commands"):
             do {
                 let command = try CodexWatchWire.decode(CodexCommand.self, from: request.body)

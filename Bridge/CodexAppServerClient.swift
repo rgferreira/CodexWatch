@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import AppKit
 
 final class CodexAppServerClient: @unchecked Sendable {
     private struct SendableParameters: @unchecked Sendable {
@@ -83,7 +84,8 @@ final class CodexAppServerClient: @unchecked Sendable {
             _ = try await request(method: "thread/resume", params: ["threadId": command.taskID])
             _ = try await request(method: "turn/start", params: [
                 "threadId": command.taskID,
-                "input": [["type": "text", "text": command.text]]
+                "input": [["type": "text", "text": command.text]],
+                "clientUserMessageId": command.id.uuidString
             ])
         } catch where Self.isActiveWriterError(error) {
             // Codex Desktop keeps the writer lock for every task it owns, even
@@ -91,6 +93,42 @@ final class CodexAppServerClient: @unchecked Sendable {
             // Codex's same-user IPC channel instead of waiting on that lock.
             try await desktopIPC.send(command)
         }
+    }
+
+    func createTask(_ command: NewTaskCommand) async throws -> String {
+        let prompt = command.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty, prompt.count <= 12_000 else {
+            throw NSError(
+                domain: "CodexWatch",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "La petición debe tener entre 1 y 12.000 caracteres"]
+            )
+        }
+
+        try start()
+        _ = try await initializeIfNeeded()
+        var startParameters: [String: Any] = ["serviceName": "codex_watch"]
+        if let projectPath = command.projectPath?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !projectPath.isEmpty {
+            startParameters["cwd"] = projectPath
+        }
+        let startResponse = try await request(method: "thread/start", params: startParameters)
+        guard let result = startResponse["result"] as? [String: Any],
+              let thread = result["thread"] as? [String: Any],
+              let threadID = thread["id"] as? String,
+              !threadID.isEmpty else {
+            throw NSError(
+                domain: "CodexWatch",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "Codex no devolvió la nueva tarea"]
+            )
+        }
+        _ = try await request(method: "turn/start", params: [
+            "threadId": threadID,
+            "input": [["type": "text", "text": prompt]],
+            "clientUserMessageId": command.id.uuidString
+        ])
+        return threadID
     }
 
     func recentMessages(threadID: String, limit: Int = 6) async throws -> [CodexMessage] {
@@ -147,8 +185,26 @@ final class CodexAppServerClient: @unchecked Sendable {
         let response = try await request(method: "initialize", params: [
             "clientInfo": ["name": "codex-watch-bridge", "title": "Codex Watch Bridge", "version": "0.4.0"]
         ])
+        try await notify(method: "initialized", params: [:])
         initialized = true
         return response
+    }
+
+    private func notify(method: String, params: [String: Any]) async throws {
+        let sendableParameters = SendableParameters(value: params)
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            queue.async {
+                let message: [String: Any] = ["method": method, "params": sendableParameters.value]
+                do {
+                    var encoded = try JSONSerialization.data(withJSONObject: message)
+                    encoded.append(0x0A)
+                    try self.input.fileHandleForWriting.write(contentsOf: encoded)
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
     }
 
     private func request(method: String, params: [String: Any]) async throws -> [String: Any] {
@@ -245,19 +301,25 @@ private final class CodexDesktopIPCClient: @unchecked Sendable {
             throw ipcError(from: initialize, fallback: "Codex Desktop rechazó la conexión local")
         }
 
-        let discoveryID = UUID().uuidString
-        try writeRequest(
+        var ownerClientID = try discoverOwner(
             descriptor: descriptor,
-            requestID: discoveryID,
-            sourceClientID: clientID,
-            version: 1,
-            method: "thread-owner-discovery",
-            params: ["hostId": "local", "conversationId": command.taskID]
+            clientID: clientID,
+            conversationID: command.taskID
         )
-        let discovery = try readResponse(descriptor: descriptor, requestID: discoveryID)
-        guard discovery["resultType"] as? String == "success",
-              let ownerClientID = discovery["handledByClientId"] as? String else {
-            throw ipcError(from: discovery, fallback: "Codex Desktop no encontró la tarea abierta")
+        if ownerClientID == nil {
+            try activateThread(command.taskID)
+            for delay in [0.2, 0.35, 0.5, 0.75, 1.0, 1.2] {
+                Thread.sleep(forTimeInterval: delay)
+                ownerClientID = try discoverOwner(
+                    descriptor: descriptor,
+                    clientID: clientID,
+                    conversationID: command.taskID
+                )
+                if ownerClientID != nil { break }
+            }
+        }
+        guard let ownerClientID else {
+            throw makeError("Codex Desktop no pudo activar la tarea para recibir la orden")
         }
 
         let startTurnID = UUID().uuidString
@@ -271,7 +333,8 @@ private final class CodexDesktopIPCClient: @unchecked Sendable {
             params: [
                 "conversationId": command.taskID,
                 "turnStartParams": [
-                    "input": [["type": "text", "text": command.text]]
+                    "input": [["type": "text", "text": command.text]],
+                    "clientUserMessageId": command.id.uuidString
                 ]
             ],
             timeoutMilliseconds: 20_000
@@ -279,6 +342,36 @@ private final class CodexDesktopIPCClient: @unchecked Sendable {
         let startTurn = try readResponse(descriptor: descriptor, requestID: startTurnID)
         guard startTurn["resultType"] as? String == "success" else {
             throw ipcError(from: startTurn, fallback: "Codex Desktop no pudo enviar la orden")
+        }
+    }
+
+    private func discoverOwner(
+        descriptor: Int32,
+        clientID: String,
+        conversationID: String
+    ) throws -> String? {
+        let discoveryID = UUID().uuidString
+        try writeRequest(
+            descriptor: descriptor,
+            requestID: discoveryID,
+            sourceClientID: clientID,
+            version: 1,
+            method: "thread-owner-discovery",
+            params: ["hostId": "local", "conversationId": conversationID],
+            timeoutMilliseconds: 1_500
+        )
+        let discovery = try readResponse(descriptor: descriptor, requestID: discoveryID)
+        if discovery["resultType"] as? String == "success" {
+            return discovery["handledByClientId"] as? String
+        }
+        if discovery["error"] as? String == "no-client-found" { return nil }
+        throw ipcError(from: discovery, fallback: "Codex Desktop no pudo localizar la tarea")
+    }
+
+    private func activateThread(_ conversationID: String) throws {
+        guard let url = URL(string: "codex://threads/\(conversationID)"),
+              NSWorkspace.shared.open(url) else {
+            throw makeError("Codex Desktop no pudo abrir la tarea seleccionada")
         }
     }
 
