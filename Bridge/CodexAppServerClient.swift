@@ -14,6 +14,7 @@ final class CodexAppServerClient: @unchecked Sendable {
     private var buffer = Data()
     private var nextID = 1
     private var pending: [Int: CheckedContinuation<Data, Error>] = [:]
+    private var threadPaths: [String: String] = [:]
     private let desktopIPC = CodexDesktopIPCClient()
 
     func start() throws {
@@ -62,8 +63,12 @@ final class CodexAppServerClient: @unchecked Sendable {
         guard let result = response["result"] as? [String: Any],
               let rows = result["data"] as? [[String: Any]] else { return [] }
 
-        return rows.compactMap { row in
+        var discoveredPaths: [String: String] = [:]
+        let tasks: [CodexTask] = rows.compactMap { row -> CodexTask? in
             guard let id = row["id"] as? String else { return nil }
+            if let path = row["path"] as? String, !path.isEmpty {
+                discoveredPaths[id] = path
+            }
             let name = (row["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
             let preview = (row["preview"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let title = (name?.isEmpty == false ? name! : preview).isEmpty ? "Tarea sin título" : (name?.isEmpty == false ? name! : preview)
@@ -75,6 +80,8 @@ final class CodexAppServerClient: @unchecked Sendable {
             let state: CodexTask.State = statusValue.contains("active") || statusValue.contains("working") ? .working : .idle
             return CodexTask(id: id, title: String(title.prefix(80)), preview: preview, projectPath: row["cwd"] as? String, updatedAt: Date(timeIntervalSince1970: updated), state: state)
         }
+        threadPaths.merge(discoveredPaths) { _, new in new }
+        return tasks
     }
 
     func send(_ command: CodexCommand) async throws {
@@ -134,6 +141,14 @@ final class CodexAppServerClient: @unchecked Sendable {
     func recentMessages(threadID: String, limit: Int = 6) async throws -> [CodexMessage] {
         try start()
         _ = try await initializeIfNeeded()
+        if let path = threadPaths[threadID] {
+            do {
+                return try Self.recentMessagesFromRollout(at: path, limit: limit)
+            } catch {
+                // Ephemeral or recently moved threads may not have a readable
+                // rollout; app-server remains the compatibility fallback.
+            }
+        }
         let response = try await request(method: "thread/read", params: [
             "threadId": threadID,
             "includeTurns": true
@@ -153,11 +168,11 @@ final class CodexAppServerClient: @unchecked Sendable {
                 if type == "userMessage" {
                     let parts = (item["content"] as? [[String: Any]]) ?? []
                     let text = parts.compactMap { $0["text"] as? String }.joined(separator: "\n")
-                    if let text = watchExcerpt(from: text) {
+                    if let text = Self.watchExcerpt(from: text) {
                         messages.append(CodexMessage(id: id, role: .user, text: text, createdAt: date))
                     }
                 } else if type == "agentMessage", let text = item["text"] as? String, !text.isEmpty {
-                    if let text = watchExcerpt(from: text) {
+                    if let text = Self.watchExcerpt(from: text) {
                         messages.append(CodexMessage(id: id, role: .assistant, text: text, createdAt: date))
                     }
                 }
@@ -166,7 +181,62 @@ final class CodexAppServerClient: @unchecked Sendable {
         return Array(messages.suffix(limit))
     }
 
-    private func watchExcerpt(from source: String, maximumLength: Int = 700) -> String? {
+    /// Reads only the tail of the local rollout instead of asking app-server to
+    /// rebuild an entire, potentially very large, thread before returning six
+    /// short messages.
+    static func recentMessagesFromRollout(at path: String, limit: Int) throws -> [CodexMessage] {
+        guard limit > 0 else { return [] }
+        let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
+        defer { try? handle.close() }
+
+        var position = try handle.seekToEnd()
+        var remainder = Data()
+        var newestFirst: [CodexMessage] = []
+        let chunkSize: UInt64 = 256 * 1_024
+
+        while position > 0, newestFirst.count < limit {
+            let count = min(position, chunkSize)
+            position -= count
+            try handle.seek(toOffset: position)
+            let chunk = try handle.read(upToCount: Int(count)) ?? Data()
+            var combined = chunk
+            combined.append(remainder)
+            let lines = combined.split(separator: 0x0A, omittingEmptySubsequences: false)
+            let firstLineIsComplete = position == 0
+            remainder = firstLineIsComplete ? Data() : Data(lines.first ?? Data.SubSequence())
+            let firstIndex = firstLineIsComplete ? 0 : 1
+
+            guard lines.count > firstIndex else { continue }
+            for index in stride(from: lines.count - 1, through: firstIndex, by: -1) {
+                guard !lines[index].isEmpty,
+                      let object = try? JSONSerialization.jsonObject(with: Data(lines[index])) as? [String: Any],
+                      object["type"] as? String == "event_msg",
+                      let payload = object["payload"] as? [String: Any],
+                      let eventType = payload["type"] as? String,
+                      eventType == "user_message" || eventType == "agent_message",
+                      let source = payload["message"] as? String,
+                      let text = watchExcerpt(from: source) else { continue }
+                let role: CodexMessage.Role = eventType == "user_message" ? .user : .assistant
+                let timestamp = object["timestamp"] as? String ?? ""
+                newestFirst.append(CodexMessage(
+                    id: "\(timestamp)-\(eventType)-\(position)-\(index)",
+                    role: role,
+                    text: text,
+                    createdAt: parseRolloutDate(timestamp)
+                ))
+                if newestFirst.count == limit { break }
+            }
+        }
+        return newestFirst.reversed()
+    }
+
+    private static func parseRolloutDate(_ source: String) -> Date {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.date(from: source) ?? ISO8601DateFormatter().date(from: source) ?? Date()
+    }
+
+    private static func watchExcerpt(from source: String, maximumLength: Int = 700) -> String? {
         let allowedControls = CharacterSet(charactersIn: "\n\t")
         let cleanedScalars = source.unicodeScalars.filter {
             !CharacterSet.controlCharacters.contains($0) || allowedControls.contains($0)

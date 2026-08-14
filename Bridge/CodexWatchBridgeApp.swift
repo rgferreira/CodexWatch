@@ -10,8 +10,8 @@ struct CodexWatchBridgeApp: App {
         MenuBarExtra {
             BridgeMenuView(controller: controller)
         } label: {
-            BridgeStatusIcon(isConnected: controller.isReady)
-                .help(controller.isReady ? "Codex Watch conectado" : "Codex Watch desconectado")
+            BridgeStatusIcon(state: controller.connectionState)
+                .help(controller.connectionState.helpText)
         }
 
         Window("Codex Watch Bridge", id: "bridge") {
@@ -105,7 +105,7 @@ final class BridgeController: ObservableObject {
     private static let logger = Logger(subsystem: "com.rgferreira.CodexWatchBridge", category: "Bridge")
 
     @Published private(set) var status = "Iniciando…"
-    @Published private(set) var isReady = false
+    @Published private(set) var connectionState: BridgeConnectionState = .unavailable
     @Published private(set) var tasks: [CodexTask] = []
     @Published private(set) var accessToken = ""
     @Published private(set) var hasOpenAIAPIKey = false
@@ -114,10 +114,13 @@ final class BridgeController: ObservableObject {
     private let openAITranscriber = OpenAITranscriptionClient()
     private var httpServer: LocalHTTPServer?
     private var retryTask: Task<Void, Never>?
+    private var connectionMonitorTask: Task<Void, Never>?
     private var isHTTPReady = false
     private var isCodexReady = false
+    private var lastSuccessfulCompanionContact: Date?
     private var authenticationLimiter = AuthenticationRateLimiter()
     private var commandReceipts: [UUID: CommandReceipt] = [:]
+    private static let companionContactTimeout: TimeInterval = 45
 
     private struct PendingDelivery {
         let command: CodexCommand
@@ -153,6 +156,7 @@ final class BridgeController: ObservableObject {
             try SecureTokenStore.save(token, service: Self.tokenService, account: Self.tokenAccount)
             accessToken = token
             authenticationLimiter.reset()
+            lastSuccessfulCompanionContact = nil
             status = "Token renovado · vuelve a pegarlo en el iPhone"
             updateReadiness(preserveStatus: true)
         } catch {
@@ -190,6 +194,7 @@ final class BridgeController: ObservableObject {
 
     private func start() async {
         guard !accessToken.isEmpty else { return }
+        startConnectionMonitor()
         retryTask?.cancel()
         retryTask = Task { [weak self] in
             guard let self else { return }
@@ -216,7 +221,8 @@ final class BridgeController: ObservableObject {
                     await refreshTasks()
                 } catch {
                     status = "Reintentando la conexión con Codex…"
-                    isReady = false
+                    isCodexReady = false
+                    updateReadiness(preserveStatus: true)
                 }
                 try? await Task.sleep(for: .seconds(10))
             }
@@ -224,17 +230,53 @@ final class BridgeController: ObservableObject {
     }
 
     private func updateReadiness(preserveStatus: Bool = false) {
-        isReady = isHTTPReady && isCodexReady
+        connectionState = .resolve(
+            localServicesReady: isHTTPReady && isCodexReady,
+            lastSuccessfulCompanionContact: lastSuccessfulCompanionContact,
+            now: Date(),
+            contactTimeout: Self.companionContactTimeout
+        )
         if preserveStatus { return }
-        if isReady {
-            status = "Conectado a Codex · red privada preparada"
-        } else if !isHTTPReady && isCodexReady {
+        switch connectionState {
+        case .connected:
+            status = "iPhone conectado · Codex y puente disponibles"
+        case .waitingForCompanion:
+            status = "Codex y puente disponibles · esperando al iPhone"
+        case .unavailable where !isHTTPReady && isCodexReady:
             status = "Codex disponible · iniciando el puente…"
+        case .unavailable:
+            break
+        }
+    }
+
+    private func startConnectionMonitor() {
+        connectionMonitorTask?.cancel()
+        connectionMonitorTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: .seconds(5))
+                } catch {
+                    return
+                }
+                guard let self else { return }
+                updateReadiness()
+            }
         }
     }
 
     private func handle(_ request: HTTPRequest) async -> HTTPResponse {
         if let rejection = authenticate(request) { return rejection }
+        let response = await handleAuthenticated(request)
+        if (200..<300).contains(response.status),
+           request.headers[CodexWatchWire.companionHTTPHeader]
+            == CodexWatchWire.companionHTTPIdentifier {
+            lastSuccessfulCompanionContact = Date()
+            updateReadiness()
+        }
+        return response
+    }
+
+    private func handleAuthenticated(_ request: HTTPRequest) async -> HTTPResponse {
         if request.path == "/health" { return .json(["status": "ok"]) }
 
         if request.method == "GET", request.path.hasPrefix("/commands/") {
@@ -413,10 +455,10 @@ final class BridgeController: ObservableObject {
 }
 
 private struct BridgeStatusIcon: View {
-    let isConnected: Bool
+    let state: BridgeConnectionState
 
     var body: some View {
-        Image(nsImage: Self.makeIcon(color: isConnected ? .systemGreen : .systemRed))
+        Image(nsImage: Self.makeIcon(color: state.color))
     }
 
     private static func makeIcon(color: NSColor) -> NSImage {
@@ -438,5 +480,23 @@ private struct BridgeStatusIcon: View {
         }
         image.isTemplate = false
         return image
+    }
+}
+
+private extension BridgeConnectionState {
+    var color: NSColor {
+        switch self {
+        case .connected: .systemGreen
+        case .waitingForCompanion: .systemOrange
+        case .unavailable: .systemRed
+        }
+    }
+
+    var helpText: String {
+        switch self {
+        case .connected: "Codex Watch conectado al iPhone"
+        case .waitingForCompanion: "Puente preparado; sin contacto reciente del iPhone"
+        case .unavailable: "Codex Watch no está disponible"
+        }
     }
 }

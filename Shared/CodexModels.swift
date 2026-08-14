@@ -87,6 +87,26 @@ struct ProjectSelectionState: Equatable, Sendable {
     }
 }
 
+enum BridgeConnectionState: Equatable, Sendable {
+    case unavailable
+    case waitingForCompanion
+    case connected
+
+    static func resolve(
+        localServicesReady: Bool,
+        lastSuccessfulCompanionContact: Date?,
+        now: Date,
+        contactTimeout: TimeInterval
+    ) -> Self {
+        guard localServicesReady else { return .unavailable }
+        guard let lastSuccessfulCompanionContact,
+              now.timeIntervalSince(lastSuccessfulCompanionContact) <= contactTimeout else {
+            return .waitingForCompanion
+        }
+        return .connected
+    }
+}
+
 enum VoiceInputMode: String, Codable, CaseIterable, Identifiable, Sendable {
     case watchDictation
     case openAIAPI
@@ -172,6 +192,8 @@ struct CommandReceipt: Codable, Hashable, Sendable {
 }
 
 enum CodexWatchWire {
+    static let companionHTTPHeader = "x-codexwatch-client"
+    static let companionHTTPIdentifier = "iphone-companion"
     static let tasks = "codexwatch.tasks"
     static let tasksRequest = "codexwatch.tasks.request"
     static let tasksResponse = "codexwatch.tasks.response"

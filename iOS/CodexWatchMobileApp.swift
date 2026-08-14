@@ -888,6 +888,10 @@ private struct MacBridgeClient: Sendable {
             ? 12
             : path == "/commands" ? 30 : 5
         request.setValue(token, forHTTPHeaderField: "X-CodexWatch-Token")
+        request.setValue(
+            CodexWatchWire.companionHTTPIdentifier,
+            forHTTPHeaderField: CodexWatchWire.companionHTTPHeader
+        )
         return request
     }
 
