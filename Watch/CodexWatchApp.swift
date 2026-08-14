@@ -103,18 +103,31 @@ private struct NewTaskView: View {
     return relay.commandReceipts[commandID]
   }
 
+  private var selectedProjectName: String {
+    guard !selectedProjectPath.isEmpty else { return "Sin proyecto" }
+    return URL(fileURLWithPath: selectedProjectPath).lastPathComponent
+  }
+
   var body: some View {
-    ScrollView {
-      VStack(alignment: .leading, spacing: 10) {
-        if !projectPaths.isEmpty {
-          Picker("Proyecto", selection: $selectedProjectPath) {
-            Text("Sin proyecto").tag("")
-            ForEach(projectPaths, id: \.self) { path in
-              Text(URL(fileURLWithPath: path).lastPathComponent).tag(path)
-            }
+    List {
+      Section("Proyecto") {
+        NavigationLink {
+          ProjectSelectionView(
+            projectPaths: projectPaths,
+            selection: $selectedProjectPath
+          )
+        } label: {
+          Label {
+            Text(selectedProjectName)
+              .lineLimit(2)
+          } icon: {
+            Image(systemName: selectedProjectPath.isEmpty ? "folder" : "folder.fill")
           }
         }
+        .accessibilityLabel("Proyecto: \(selectedProjectName)")
+      }
 
+      Section("Petición") {
         TextFieldLink(prompt: Text("Describe la nueva tarea")) {
           Label(prompt.isEmpty ? "Dictar petición" : "Volver a dictar", systemImage: "mic.fill")
         } onSubmit: {
@@ -138,8 +151,10 @@ private struct NewTaskView: View {
           .tint(.green)
           .disabled(receipt?.state == .queued)
         }
+      }
 
-        if let receipt {
+      if let receipt {
+        Section("Estado") {
           switch receipt.state {
           case .queued:
             HStack {
@@ -184,6 +199,48 @@ private struct NewTaskView: View {
         dismiss()
       }
     }
+  }
+}
+
+private struct ProjectSelectionView: View {
+  let projectPaths: [String]
+  @Binding var selection: String
+  @Environment(\.dismiss) private var dismiss
+
+  var body: some View {
+    List {
+      projectButton(title: "Sin proyecto", path: "", systemImage: "folder")
+      ForEach(projectPaths, id: \.self) { path in
+        projectButton(
+          title: URL(fileURLWithPath: path).lastPathComponent,
+          path: path,
+          systemImage: "folder.fill"
+        )
+      }
+    }
+    .navigationTitle("Proyecto")
+  }
+
+  private func projectButton(title: String, path: String, systemImage: String) -> some View {
+    Button {
+      selection = path
+      WKInterfaceDevice.current().play(.click)
+      dismiss()
+    } label: {
+      HStack(spacing: 8) {
+        Image(systemName: systemImage)
+          .foregroundStyle(.blue)
+        Text(title)
+          .lineLimit(2)
+        Spacer(minLength: 2)
+        if selection == path {
+          Image(systemName: "checkmark")
+            .foregroundStyle(.green)
+        }
+      }
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
   }
 }
 
