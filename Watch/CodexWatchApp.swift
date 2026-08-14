@@ -86,7 +86,7 @@ private struct NewTaskView: View {
   @Environment(\.dismiss) private var dismiss
 
   @State private var prompt = ""
-  @State private var selectedProjectPath = ""
+  @State private var projectSelection = ProjectSelectionState()
   @State private var commandID: UUID?
 
   private var projectPaths: [String] {
@@ -104,8 +104,15 @@ private struct NewTaskView: View {
   }
 
   private var selectedProjectName: String {
-    guard !selectedProjectPath.isEmpty else { return "Sin proyecto" }
-    return URL(fileURLWithPath: selectedProjectPath).lastPathComponent
+    guard !projectSelection.selectedPath.isEmpty else { return "Sin proyecto" }
+    return URL(fileURLWithPath: projectSelection.selectedPath).lastPathComponent
+  }
+
+  private var selectedProjectPath: Binding<String> {
+    Binding(
+      get: { projectSelection.selectedPath },
+      set: { projectSelection.select($0) }
+    )
   }
 
   var body: some View {
@@ -114,14 +121,14 @@ private struct NewTaskView: View {
         NavigationLink {
           ProjectSelectionView(
             projectPaths: projectPaths,
-            selection: $selectedProjectPath
+            selection: selectedProjectPath
           )
         } label: {
           Label {
             Text(selectedProjectName)
               .lineLimit(2)
           } icon: {
-            Image(systemName: selectedProjectPath.isEmpty ? "folder" : "folder.fill")
+            Image(systemName: projectSelection.selectedPath.isEmpty ? "folder" : "folder.fill")
           }
         }
         .accessibilityLabel("Proyecto: \(selectedProjectName)")
@@ -142,7 +149,9 @@ private struct NewTaskView: View {
             .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
 
           Button("Crear tarea") {
-            let projectPath = selectedProjectPath.isEmpty ? nil : selectedProjectPath
+            let projectPath = projectSelection.selectedPath.isEmpty
+              ? nil
+              : projectSelection.selectedPath
             commandID = relay.createTask(
               NewTaskCommand(prompt: prompt, projectPath: projectPath)
             )
@@ -175,7 +184,7 @@ private struct NewTaskView: View {
     }
     .navigationTitle("Nueva tarea")
     .onAppear {
-      if selectedProjectPath.isEmpty { selectedProjectPath = projectPaths.first ?? "" }
+      projectSelection.initializeIfNeeded(projectPaths: projectPaths)
     }
     .task(id: commandID) {
       guard let commandID else { return }

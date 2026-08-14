@@ -71,6 +71,22 @@ struct NewTaskCommand: Codable, Identifiable, Hashable, Sendable {
     }
 }
 
+struct ProjectSelectionState: Equatable, Sendable {
+    private(set) var selectedPath = ""
+    private(set) var isInitialized = false
+
+    mutating func initializeIfNeeded(projectPaths: [String]) {
+        guard !isInitialized else { return }
+        selectedPath = projectPaths.first ?? ""
+        isInitialized = true
+    }
+
+    mutating func select(_ path: String) {
+        selectedPath = path
+        isInitialized = true
+    }
+}
+
 enum VoiceInputMode: String, Codable, CaseIterable, Identifiable, Sendable {
     case watchDictation
     case openAIAPI
