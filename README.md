@@ -4,9 +4,9 @@ Aplicación experimental para seleccionar una tarea reciente de Codex desde el A
 
 ## See it in action
 
-<a href="docs/assets/codexwatch-demo.mp4?raw=1"><img src="docs/assets/codexwatch-demo-poster.png" alt="Codex Watch — watch the one-minute demo" width="100%"></a>
+<p align="center"><img src="docs/assets/codexwatch-demo.gif" alt="Codex Watch one-minute demo" width="360"></p>
 
-<p align="center"><strong>Tap the preview to watch the complete one-minute walkthrough.</strong></p>
+<p align="center"><sub>Full one-minute walkthrough · plays directly in the README.</sub></p>
 
 ## Componentes
 
