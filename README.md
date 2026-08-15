@@ -4,11 +4,9 @@ Aplicación experimental para seleccionar una tarea reciente de Codex desde el A
 
 ## See it in action
 
-> **From your wrist to Codex in under a minute.**
->
-> Browse live tasks, review the conversation, dictate a command and start a new task — without reaching for the Mac.
+<a href="docs/assets/codexwatch-demo.mp4?raw=1"><img src="docs/assets/codexwatch-demo-poster.png" alt="Codex Watch — watch the one-minute demo" width="100%"></a>
 
-https://github.com/user-attachments/assets/eb976832-ccf3-4a5d-9be8-8c9d59685c90
+<p align="center"><strong>Tap the preview to watch the complete one-minute walkthrough.</strong></p>
 
 ## Componentes
 
