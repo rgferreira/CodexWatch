@@ -117,14 +117,20 @@ final class BridgeController: ObservableObject {
     private var connectionMonitorTask: Task<Void, Never>?
     private var isHTTPReady = false
     private var isCodexReady = false
+    private var refreshInProgress = false
+    private var creationInProgress = false
     private var lastSuccessfulCompanionContact: Date?
     private var authenticationLimiter = AuthenticationRateLimiter()
     private var commandReceipts: [UUID: CommandReceipt] = [:]
+    private var operationSafety = BridgeOperationSafety()
+    private var readBreakers: [String: OperationCircuitBreaker] = [:]
     private static let companionContactTimeout: TimeInterval = 45
 
     private struct PendingDelivery {
         let command: CodexCommand
         let successMessage: String
+        let correlationID: String
+        let origin: String
     }
 
     init() {
@@ -182,6 +188,9 @@ final class BridgeController: ObservableObject {
     }
 
     func refreshTasks() async {
+        guard !refreshInProgress, !creationInProgress else { return }
+        refreshInProgress = true
+        defer { refreshInProgress = false }
         do {
             tasks = try await appServer.listTasks()
             isCodexReady = true
@@ -297,7 +306,21 @@ final class BridgeController: ObservableObject {
                 return .badRequest
             }
             do {
+                let started = Date()
+                creationInProgress = true
+                defer { creationInProgress = false }
                 if let existing = commandReceipts[command.id] { return .encodable(existing) }
+                let operationThread = "new-task"
+                let correlationID = correlationID(for: request)
+                switch operationSafety.beginWrite(commandID: command.id, threadID: operationThread) {
+                case .duplicate(let receipt): return .encodable(receipt)
+                case .threadBusy:
+                    return .encodable(CommandReceipt(commandID: command.id, state: .failed, message: "Ya hay una creación en curso"))
+                case .circuitOpen:
+                    return .encodable(CommandReceipt(commandID: command.id, state: .failed, message: "Protección activa; inténtalo de nuevo en un minuto"))
+                case .started:
+                    telemetry(correlationID, threadID: operationThread, operation: "create", origin: origin(for: request), result: "start")
+                }
                 if let projectPath = command.projectPath,
                    !projectPath.isEmpty,
                    !tasks.contains(where: { $0.projectPath == projectPath }) {
@@ -313,6 +336,8 @@ final class BridgeController: ObservableObject {
                     state: .sent,
                     message: "Tarea creada"
                 )
+                operationSafety.finishWrite(threadID: operationThread, receipt: receipt)
+                telemetry(correlationID, threadID: operationThread, operation: "create", origin: origin(for: request), result: "success", duration: Date().timeIntervalSince(started))
                 remember(receipt)
                 await refreshTasks()
                 return .encodable(receipt)
@@ -323,7 +348,9 @@ final class BridgeController: ObservableObject {
                     state: .failed,
                     message: error.localizedDescription
                 )
+                operationSafety.finishWrite(threadID: "new-task", receipt: receipt)
                 remember(receipt)
+                telemetry(correlationID(for: request), threadID: "new-task", operation: "create", origin: origin(for: request), result: telemetryResult(for: error))
                 return .encodable(receipt)
             }
         case ("POST", "/commands"):
@@ -331,7 +358,12 @@ final class BridgeController: ObservableObject {
                 let command = try CodexWatchWire.decode(CodexCommand.self, from: request.body)
                 if let existing = commandReceipts[command.id] { return .encodable(existing) }
                 let receipt = await deliver(
-                    PendingDelivery(command: command, successMessage: "Orden enviada")
+                    PendingDelivery(
+                        command: command,
+                        successMessage: "Orden enviada",
+                        correlationID: correlationID(for: request),
+                        origin: origin(for: request)
+                    )
                 )
                 return .encodable(receipt)
             } catch {
@@ -345,14 +377,28 @@ final class BridgeController: ObservableObject {
             let suffix = "/messages"
             if request.method == "GET",
                request.path.hasPrefix(prefix), request.path.hasSuffix(suffix) {
+                let start = request.path.index(request.path.startIndex, offsetBy: prefix.count)
+                let end = request.path.index(request.path.endIndex, offsetBy: -suffix.count)
+                let taskID = String(request.path[start..<end])
+                guard !taskID.isEmpty else { return .notFound }
+                var breaker = readBreakers[taskID] ?? OperationCircuitBreaker()
+                guard breaker.allowsOperation() else {
+                    readBreakers[taskID] = breaker
+                    return .serverError()
+                }
+                let correlationID = correlationID(for: request)
+                let started = Date()
                 do {
-                    let start = request.path.index(request.path.startIndex, offsetBy: prefix.count)
-                    let end = request.path.index(request.path.endIndex, offsetBy: -suffix.count)
-                    let taskID = String(request.path[start..<end])
-                    guard !taskID.isEmpty else { return .notFound }
+                    telemetry(correlationID, threadID: taskID, operation: "read", origin: origin(for: request), result: "start")
                     let messages = try await appServer.recentMessages(threadID: taskID)
+                    breaker.recordSuccess()
+                    readBreakers[taskID] = breaker
+                    telemetry(correlationID, threadID: taskID, operation: "read", origin: origin(for: request), result: "success", duration: Date().timeIntervalSince(started))
                     return .encodable(CodexConversation(taskID: taskID, messages: messages))
                 } catch {
+                    breaker.recordFailure()
+                    readBreakers[taskID] = breaker
+                    telemetry(correlationID, threadID: taskID, operation: "read", origin: origin(for: request), result: telemetryResult(for: error), duration: Date().timeIntervalSince(started))
                     Self.logger.error("No se pudo recuperar una conversación: \(error.localizedDescription, privacy: .private)")
                     return .serverError()
                 }
@@ -370,6 +416,19 @@ final class BridgeController: ObservableObject {
             return .badRequest
         }
         if let existing = commandReceipts[voiceCommand.id] { return .encodable(existing) }
+
+        let correlationID = correlationID(for: request)
+        let origin = origin(for: request)
+        switch operationSafety.beginWrite(commandID: voiceCommand.id, threadID: voiceCommand.taskID) {
+        case .duplicate(let receipt): return .encodable(receipt)
+        case .threadBusy:
+            return .encodable(CommandReceipt(commandID: voiceCommand.id, state: .failed, message: "Otra orden ya está en curso para esta tarea"))
+        case .circuitOpen:
+            return .encodable(CommandReceipt(commandID: voiceCommand.id, state: .failed, message: "Reintentos detenidos temporalmente para proteger la tarea"))
+        case .started:
+            telemetry(correlationID, threadID: voiceCommand.taskID, operation: "voice-write", origin: origin, result: "start")
+        }
+        let started = Date()
 
         let audioURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("codexwatch-\(voiceCommand.id.uuidString)")
@@ -389,11 +448,10 @@ final class BridgeController: ObservableObject {
                 model: voiceCommand.transcriptionModel,
                 apiKey: apiKey
             )
-            let receipt = await deliver(
-                PendingDelivery(
-                    command: CodexCommand(voiceCommand: voiceCommand, text: transcript),
-                    successMessage: "Orden transcrita y enviada"
-                )
+            let receipt = await sendAcquired(
+                PendingDelivery(command: CodexCommand(voiceCommand: voiceCommand, text: transcript), successMessage: "Orden transcrita y enviada", correlationID: correlationID, origin: origin),
+                operation: "voice-write",
+                started: started
             )
             return .encodable(receipt)
         } catch {
@@ -403,29 +461,102 @@ final class BridgeController: ObservableObject {
                 state: .failed,
                 message: error.localizedDescription
             )
+            operationSafety.finishWrite(threadID: voiceCommand.taskID, receipt: receipt)
+            remember(receipt)
+            telemetry(correlationID, threadID: voiceCommand.taskID, operation: "voice-write", origin: origin, result: telemetryResult(for: error), duration: Date().timeIntervalSince(started))
             return .encodable(receipt)
         }
     }
 
     private func deliver(_ delivery: PendingDelivery) async -> CommandReceipt {
+        switch operationSafety.beginWrite(
+            commandID: delivery.command.id,
+            threadID: delivery.command.taskID
+        ) {
+        case .duplicate(let receipt): return receipt
+        case .threadBusy:
+            return CommandReceipt(
+                commandID: delivery.command.id,
+                state: .failed,
+                message: "Otra orden ya está en curso para esta tarea"
+            )
+        case .circuitOpen:
+            return CommandReceipt(
+                commandID: delivery.command.id,
+                state: .failed,
+                message: "Reintentos detenidos temporalmente para proteger la tarea"
+            )
+        case .started:
+            telemetry(
+                delivery.correlationID,
+                threadID: delivery.command.taskID,
+                operation: "write",
+                origin: delivery.origin,
+                result: "start"
+            )
+        }
+        return await sendAcquired(delivery, operation: "write", started: Date())
+    }
+
+    private func sendAcquired(
+        _ delivery: PendingDelivery,
+        operation: String,
+        started: Date
+    ) async -> CommandReceipt {
+        let receipt: CommandReceipt
         do {
             try await appServer.send(delivery.command)
-            let receipt = CommandReceipt(
+            receipt = CommandReceipt(
                 commandID: delivery.command.id,
                 state: .sent,
                 message: delivery.successMessage
             )
-            remember(receipt)
-            return receipt
         } catch {
-            let receipt = CommandReceipt(
+            receipt = CommandReceipt(
                 commandID: delivery.command.id,
                 state: .failed,
                 message: error.localizedDescription
             )
-            remember(receipt)
-            return receipt
         }
+        operationSafety.finishWrite(threadID: delivery.command.taskID, receipt: receipt)
+        remember(receipt)
+        telemetry(
+            delivery.correlationID,
+            threadID: delivery.command.taskID,
+            operation: operation,
+            origin: delivery.origin,
+            result: receipt.state == .sent ? "success" : "failed",
+            duration: Date().timeIntervalSince(started)
+        )
+        return receipt
+    }
+
+    private func telemetryResult(for error: Error) -> String {
+        if error is CancellationError { return "cancelled" }
+        if (error as? URLError)?.code == .timedOut { return "timeout" }
+        return "failed"
+    }
+
+    private func correlationID(for request: HTTPRequest) -> String {
+        request.headers[CodexWatchWire.correlationHTTPHeader] ?? UUID().uuidString
+    }
+
+    private func origin(for request: HTTPRequest) -> String {
+        request.headers[CodexWatchWire.originHTTPHeader] ?? "unknown"
+    }
+
+    private func telemetry(
+        _ correlationID: String,
+        threadID: String,
+        operation: String,
+        origin: String,
+        result: String,
+        duration: TimeInterval? = nil
+    ) {
+        let elapsed = duration.map { String(format: "%.3f", $0) } ?? "-"
+        Self.logger.notice(
+            "correlation=\(correlationID, privacy: .public) thread=\(threadID, privacy: .public) operation=\(operation, privacy: .public) origin=\(origin, privacy: .public) result=\(result, privacy: .public) duration=\(elapsed, privacy: .public)"
+        )
     }
 
     private func remember(_ receipt: CommandReceipt) {

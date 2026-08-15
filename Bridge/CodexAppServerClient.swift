@@ -8,12 +8,14 @@ final class CodexAppServerClient: @unchecked Sendable {
     }
 
     private let queue = DispatchQueue(label: "CodexWatch.AppServer")
-    private let input = Pipe()
-    private let output = Pipe()
+    private var input = Pipe()
+    private var output = Pipe()
     private var process: Process?
     private var buffer = Data()
     private var nextID = 1
     private var pending: [Int: CheckedContinuation<Data, Error>] = [:]
+    private var turnWaiters: [String: CheckedContinuation<Void, Error>] = [:]
+    private var completedTurns = Set<String>()
     private var threadPaths: [String: String] = [:]
     private let desktopIPC = CodexDesktopIPCClient()
 
@@ -41,9 +43,13 @@ final class CodexAppServerClient: @unchecked Sendable {
             guard let client = self else { return }
             client.queue.async { [weak client] in client?.consume(data) }
         }
-        process.terminationHandler = { [weak self] _ in
-            guard let client = self else { return }
-            client.queue.async { [weak client] in client?.failAll(message: "Codex app-server se ha cerrado") }
+        process.terminationHandler = { [weak self, weak process] _ in
+            guard let client = self, let terminatedProcess = process else { return }
+            client.queue.async { [weak client, weak terminatedProcess] in
+                guard let client, let terminatedProcess,
+                      client.process === terminatedProcess else { return }
+                client.failAll(message: "Codex app-server se ha cerrado")
+            }
         }
         try process.run()
         self.process = process
@@ -85,21 +91,12 @@ final class CodexAppServerClient: @unchecked Sendable {
     }
 
     func send(_ command: CodexCommand) async throws {
-        try start()
-        _ = try await initializeIfNeeded()
-        do {
-            _ = try await request(method: "thread/resume", params: ["threadId": command.taskID])
-            _ = try await request(method: "turn/start", params: [
-                "threadId": command.taskID,
-                "input": [["type": "text", "text": command.text]],
-                "clientUserMessageId": command.id.uuidString
-            ])
-        } catch where Self.isActiveWriterError(error) {
-            // Codex Desktop keeps the writer lock for every task it owns, even
-            // while it is idle. Ask that existing owner to start the turn over
-            // Codex's same-user IPC channel instead of waiting on that lock.
-            try await desktopIPC.send(command)
-        }
+        // Never resume an existing thread from the Bridge. `thread/resume`
+        // grants writer ownership to this long-lived app-server process and can
+        // make the task appear "open elsewhere" in Codex Desktop. A user-
+        // initiated command is routed to Desktop's existing owner over an
+        // ephemeral IPC connection instead.
+        try await desktopIPC.send(command)
     }
 
     func createTask(_ command: NewTaskCommand) async throws -> String {
@@ -113,6 +110,7 @@ final class CodexAppServerClient: @unchecked Sendable {
         }
 
         try start()
+        defer { shutdown() }
         _ = try await initializeIfNeeded()
         var startParameters: [String: Any] = ["serviceName": "codex_watch"]
         if let projectPath = command.projectPath?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -130,55 +128,40 @@ final class CodexAppServerClient: @unchecked Sendable {
                 userInfo: [NSLocalizedDescriptionKey: "Codex no devolvió la nueva tarea"]
             )
         }
-        _ = try await request(method: "turn/start", params: [
+        let turnResponse = try await request(method: "turn/start", params: [
             "threadId": threadID,
             "input": [["type": "text", "text": prompt]],
             "clientUserMessageId": command.id.uuidString
         ])
+        let turnID = ((turnResponse["result"] as? [String: Any])?["turn"] as? [String: Any])?["id"] as? String
+        do {
+            try await waitForTurnCompletion(threadID: threadID, timeout: 120)
+        } catch {
+            if let turnID {
+                _ = try? await request(
+                    method: "turn/interrupt",
+                    params: ["threadId": threadID, "turnId": turnID],
+                    timeout: 5
+                )
+            }
+            throw error
+        }
         return threadID
     }
 
     func recentMessages(threadID: String, limit: Int = 6) async throws -> [CodexMessage] {
-        try start()
-        _ = try await initializeIfNeeded()
         if let path = threadPaths[threadID] {
             do {
                 return try Self.recentMessagesFromRollout(at: path, limit: limit)
             } catch {
                 // Ephemeral or recently moved threads may not have a readable
-                // rollout; app-server remains the compatibility fallback.
+                // rollout. Do not fall back to an ownership-affecting API.
             }
         }
-        let response = try await request(method: "thread/read", params: [
-            "threadId": threadID,
-            "includeTurns": true
-        ])
-
-        guard let result = response["result"] as? [String: Any],
-              let thread = result["thread"] as? [String: Any],
-              let turns = thread["turns"] as? [[String: Any]] else { return [] }
-
-        var messages: [CodexMessage] = []
-        for turn in turns {
-            let timestamp = (turn["startedAt"] as? NSNumber)?.doubleValue ?? Date().timeIntervalSince1970
-            let date = Date(timeIntervalSince1970: timestamp)
-            for item in (turn["items"] as? [[String: Any]]) ?? [] {
-                guard let type = item["type"] as? String,
-                      let id = item["id"] as? String else { continue }
-                if type == "userMessage" {
-                    let parts = (item["content"] as? [[String: Any]]) ?? []
-                    let text = parts.compactMap { $0["text"] as? String }.joined(separator: "\n")
-                    if let text = Self.watchExcerpt(from: text) {
-                        messages.append(CodexMessage(id: id, role: .user, text: text, createdAt: date))
-                    }
-                } else if type == "agentMessage", let text = item["text"] as? String, !text.isEmpty {
-                    if let text = Self.watchExcerpt(from: text) {
-                        messages.append(CodexMessage(id: id, role: .assistant, text: text, createdAt: date))
-                    }
-                }
-            }
-        }
-        return Array(messages.suffix(limit))
+        // Strict read-only mode: never call thread/read or thread/resume merely
+        // because a conversation was opened. If no local rollout exists, the
+        // safe result is an empty conversation.
+        return []
     }
 
     /// Reads only the tail of the local rollout instead of asking app-server to
@@ -263,7 +246,7 @@ final class CodexAppServerClient: @unchecked Sendable {
     private func notify(method: String, params: [String: Any]) async throws {
         let sendableParameters = SendableParameters(value: params)
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            queue.async {
+            queue.async { [self] in
                 let message: [String: Any] = ["method": method, "params": sendableParameters.value]
                 do {
                     var encoded = try JSONSerialization.data(withJSONObject: message)
@@ -277,10 +260,14 @@ final class CodexAppServerClient: @unchecked Sendable {
         }
     }
 
-    private func request(method: String, params: [String: Any]) async throws -> [String: Any] {
+    private func request(
+        method: String,
+        params: [String: Any],
+        timeout: TimeInterval = 8
+    ) async throws -> [String: Any] {
         let sendableParameters = SendableParameters(value: params)
         let data: Data = try await withCheckedThrowingContinuation { continuation in
-            queue.async {
+            queue.async { [self] in
                 let id = self.nextID
                 self.nextID += 1
                 let message: [String: Any] = ["method": method, "id": id, "params": sendableParameters.value]
@@ -289,7 +276,12 @@ final class CodexAppServerClient: @unchecked Sendable {
                     encoded.append(0x0A)
                     self.pending[id] = continuation
                     try self.input.fileHandleForWriting.write(contentsOf: encoded)
+                    self.queue.asyncAfter(deadline: .now() + timeout) { [weak self] in
+                        guard let continuation = self?.pending.removeValue(forKey: id) else { return }
+                        continuation.resume(throwing: URLError(.timedOut))
+                    }
                 } catch {
+                    self.pending.removeValue(forKey: id)
                     continuation.resume(throwing: error)
                 }
             }
@@ -310,10 +302,37 @@ final class CodexAppServerClient: @unchecked Sendable {
             let line = buffer.subdata(in: 0..<newline)
             buffer.removeSubrange(0...newline)
             guard !line.isEmpty,
-                  let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-                  let id = (object["id"] as? NSNumber)?.intValue,
-                  let continuation = pending.removeValue(forKey: id) else { continue }
-            continuation.resume(returning: line)
+                  let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
+            if let id = (object["id"] as? NSNumber)?.intValue,
+               let continuation = pending.removeValue(forKey: id) {
+                continuation.resume(returning: line)
+                continue
+            }
+            if object["method"] as? String == "turn/completed",
+               let params = object["params"] as? [String: Any],
+               let threadID = params["threadId"] as? String {
+                if let waiter = turnWaiters.removeValue(forKey: threadID) {
+                    waiter.resume()
+                } else {
+                    completedTurns.insert(threadID)
+                }
+            }
+        }
+    }
+
+    private func waitForTurnCompletion(threadID: String, timeout: TimeInterval) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async { [self] in
+                if completedTurns.remove(threadID) != nil {
+                    continuation.resume()
+                    return
+                }
+                turnWaiters[threadID] = continuation
+                queue.asyncAfter(deadline: .now() + timeout) { [weak self] in
+                    guard let waiter = self?.turnWaiters.removeValue(forKey: threadID) else { return }
+                    waiter.resume(throwing: URLError(.timedOut))
+                }
+            }
         }
     }
 
@@ -322,12 +341,28 @@ final class CodexAppServerClient: @unchecked Sendable {
         let continuations = pending.values
         pending.removeAll()
         continuations.forEach { $0.resume(throwing: error) }
+        let waiters = turnWaiters.values
+        turnWaiters.removeAll()
+        completedTurns.removeAll()
+        waiters.forEach { $0.resume(throwing: error) }
         process = nil
         initialized = false
     }
 
-    private static func isActiveWriterError(_ error: Error) -> Bool {
-        error.localizedDescription.localizedCaseInsensitiveContains("already has an active writer")
+    private func shutdown() {
+        queue.sync {
+            output.fileHandleForReading.readabilityHandler = nil
+            process?.terminationHandler = nil
+            if process?.isRunning == true {
+                process?.terminate()
+                process?.waitUntilExit()
+            }
+            process = nil
+            initialized = false
+            failAll(message: "Codex app-server cerrado tras la escritura")
+            input = Pipe()
+            output = Pipe()
+        }
     }
 }
 

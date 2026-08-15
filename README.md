@@ -2,13 +2,21 @@
 
 Aplicación experimental para seleccionar una tarea reciente de Codex desde el Apple Watch, consultar sus últimos mensajes, grabar una orden de voz y enviarla al Codex que se ejecuta en el Mac.
 
+## See it in action
+
+> **From your wrist to Codex in under a minute.**
+>
+> Browse live tasks, review the conversation, dictate a command and start a new task — without reaching for the Mac.
+
+https://github.com/user-attachments/assets/eb976832-ccf3-4a5d-9be8-8c9d59685c90
+
 ## Componentes
 
 - `CodexWatch`: app compañera para iPhone y enlace con WatchConnectivity.
 - `CodexWatch Watch App`: selector cronológico, lectura de mensajes, dictado o grabación y envío de órdenes.
 - `CodexWatchBridge`: puente local autenticado que habla con `codex app-server`.
 
-El puente acepta conexiones procedentes de redes privadas, loopback y, cuando está disponible, del CIDR detectado de ZeroTier. Exige el token de acceso mostrado por la aplicación de macOS y no publica Bonjour.
+El puente detecta ZeroTier y vincula el listener exclusivamente a esa IPv4 y su CIDR. Exige el token de acceso mostrado por la aplicación de macOS y no publica Bonjour.
 
 El icono de la barra de menús representa la conexión extremo a extremo: verde únicamente después de una respuesta autenticada reciente al Companion del iPhone, naranja cuando Codex y el puente están preparados pero no hay contacto reciente con el iPhone, y rojo si falla cualquiera de los servicios locales. El contacto verde caduca tras 45 segundos sin una nueva respuesta satisfactoria. El reloj conserva localmente los últimos mensajes de las conversaciones consultadas y los muestra inmediatamente al abrir una tarea. El puente lee de forma acotada el final del historial local, por lo que una conversación grande no obliga a reconstruirla completa. Solo vuelve a solicitar una conversación cuando la marca `updatedAt` de la lista anuncia información nueva; la actualización ocurre en segundo plano sin ocultar los mensajes ni alterar la posición de lectura.
 
@@ -31,11 +39,11 @@ Si Codex Desktop ya es propietario de la tarea seleccionada, el bridge entrega l
 
 Configura en la app del iPhone el método de conexión, la IP o nombre del Mac, el puerto y el token copiado desde el bridge. La dirección queda guardada únicamente en el dispositivo y no forma parte del código fuente. El token aleatorio de 256 bits se guarda en Keychain tanto en macOS como en iOS. WatchConnectivity mantiene el Apple Watch desacoplado de este detalle: el reloj habla con el iPhone y el iPhone reenvía la petición al Mac.
 
-Para usarlo fuera de casa, la opción recomendada es una IP privada accesible mediante ZeroTier, Tailscale o WireGuard. En la misma red también puede usarse una IPv4 privada o un nombre `.local`. El cliente solo permite HTTP para esos destinos privados; un dominio o una IP pública exige HTTPS y un proxy seguro. El puerto HTTP `48720` del bridge no debe publicarse directamente en Internet.
+Para usarlo fuera de casa, la configuración activa del bridge usa la IP privada de ZeroTier detectada en el Mac. El cliente admite configurar otros destinos privados, pero requieren que el servicio correspondiente se vincule explícitamente a esa interfaz; no se abre automáticamente en Wi-Fi/LAN. Un dominio o una IP pública exige HTTPS y un proxy seguro. El puerto HTTP `48720` del bridge no debe publicarse directamente en Internet.
 
 ## Controles de seguridad
 
-- Allowlist de orígenes privados y loopback, complementada con el CIDR que comunica `zerotier-cli` cuando ZeroTier está activo; cualquier origen ajeno se cancela antes de leer datos.
+- Listener vinculado a la IPv4 que comunica `zerotier-cli`, más allowlist de su CIDR y loopback; cualquier origen ajeno se cancela antes de leer datos.
 - Token de 256 bits generado con `SecRandomCopyBytes`, almacenado en Keychain y comparado en tiempo constante.
 - Bloqueo temporal tras cinco intentos de autenticación fallidos por origen.
 - Máximo de 24 conexiones simultáneas y tiempo máximo de 90 segundos por conexión.
@@ -48,3 +56,7 @@ La superficie y las limitaciones conocidas se documentan en [SECURITY.md](SECURI
 ## Puente del Mac
 
 La compilación activa puede instalarse en `~/Applications/CodexWatchBridge.app`. Un LaunchAgent local puede iniciarla al abrir sesión. El icono rojo indica que Codex o el servidor privado no están listos, el naranja que el Mac está preparado pero todavía no ha respondido recientemente al Companion, y el verde confirma una respuesta autenticada reciente al iPhone. El endpoint `/health` solo acepta orígenes de red privada y requiere el token.
+
+## Seguridad de conversaciones
+
+Listar tareas y abrir mensajes son operaciones estrictamente de solo lectura y nunca reanudan un hilo. Solo una acción explícita de enviar o crear puede escribir. Los comandos se deduplican por UUID, se serializan por hilo y dejan de reintentarse temporalmente después de tres fallos. Las escrituras a tareas existentes se entregan al propietario activo de Codex Desktop mediante una conexión efímera; el puente no adquiere propiedad persistente del hilo. Véase [el informe del incidente del 15-08-2026](docs/INCIDENT-2026-08-15.md).

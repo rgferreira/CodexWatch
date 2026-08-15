@@ -5,12 +5,208 @@ import WatchKit
 @main
 struct CodexWatchApp: App {
   @StateObject private var relay = WatchRelay.shared
+  private let automatedDemo = ProcessInfo.processInfo.arguments.contains("--codexwatch-autodemo")
 
   var body: some Scene {
     WindowGroup {
-      TaskPickerView()
-        .environmentObject(relay)
-        .onAppear { relay.start() }
+      if automatedDemo {
+        AutomatedDemoView()
+      } else {
+        TaskPickerView()
+          .environmentObject(relay)
+          .onAppear { relay.start() }
+      }
+    }
+  }
+}
+
+private struct AutomatedDemoView: View {
+  @State private var phase = 0
+  @State private var landingTarget = 0
+  @State private var conversationTarget = 0
+
+  private let tasks = [
+    "Prepare the Aurora launch", "Polish the iPhone onboarding",
+    "Weekly trends briefing", "Episode 12 script",
+    "August executive dashboard", "Companion security review",
+    "Ideas for the next release", "Public website copy"
+  ]
+
+  var body: some View {
+    Group {
+      if phase <= 2 || phase == 8 {
+        landing
+      } else if phase <= 7 {
+        conversation
+      } else if phase == 10 {
+        projectPicker
+      } else {
+        newTask
+      }
+    }
+    .task { await play() }
+  }
+
+  private var landing: some View {
+    VStack(spacing: 4) {
+      HStack {
+        demoCircleButton("plus")
+        Spacer()
+        Text("Tasks").font(.headline)
+        Spacer()
+        demoCircleButton("arrow.clockwise")
+      }
+      ScrollViewReader { proxy in
+        ScrollView {
+          LazyVStack(spacing: 7) {
+            ForEach(Array(tasks.enumerated()), id: \.offset) { index, title in
+              HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                  Text(title).font(.body).lineLimit(2)
+                  Text(index == 0 ? "1 min" : "\(index * 4 + 3) min")
+                    .font(.caption2).foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 3)
+                if index == 0 || index == 4 { ProgressView().controlSize(.mini).tint(.green) }
+                if index == 2 {
+                  Image(systemName: "exclamationmark.circle.fill").foregroundStyle(.orange)
+                }
+              }
+              .padding(9)
+              .background(.quaternary, in: RoundedRectangle(cornerRadius: 12))
+              .id(index)
+            }
+          }
+        }
+        .onChange(of: landingTarget) { _, value in
+          withAnimation(.easeInOut(duration: 1.4)) {
+            proxy.scrollTo(value, anchor: value == 0 ? .top : .center)
+          }
+        }
+      }
+    }
+    .padding(.horizontal, 4)
+  }
+
+  private var conversation: some View {
+    Group {
+      if phase <= 4 {
+        ScrollViewReader { proxy in
+          ScrollView {
+            VStack(alignment: .leading, spacing: 8) {
+              Text("Prepare the Aurora launch")
+                .font(.headline).lineLimit(1)
+              if phase == 3 {
+                HStack { Spacer(); ProgressView(); Spacer() }.padding(.vertical, 40)
+              } else {
+                Text("Recent messages").font(.caption.bold()).foregroundStyle(.secondary)
+                demoMessage("You", "Is the beta launch plan ready?", .cyan).id(0)
+                demoMessage("Codex", "Yes. The build passed every test and deployment is ready.", .purple).id(1)
+                demoMessage("You", "Check the complete experience from the Watch.", .cyan).id(2)
+                demoMessage("Codex", "Navigation, dictation and task creation are ready.", .purple).id(3)
+              }
+            }
+          }
+          .onChange(of: conversationTarget) { _, value in
+            withAnimation(.easeInOut(duration: 1.6)) {
+              proxy.scrollTo(value, anchor: value == 0 ? .top : .bottom)
+            }
+          }
+        }
+      } else {
+        VStack(alignment: .leading, spacing: 8) {
+          Text("Prepare the Aurora launch").font(.headline).lineLimit(1)
+          Text("Recent messages").font(.caption.bold()).foregroundStyle(.secondary)
+          demoMessage("Codex", "Deployment is ready.", .purple)
+          if phase == 5 {
+            HStack(spacing: 7) {
+              Image(systemName: "waveform").symbolEffect(.variableColor.iterative)
+              Text("Listening…").font(.headline)
+            }
+            .frame(maxWidth: .infinity).padding(12)
+            .background(.red.opacity(0.22), in: RoundedRectangle(cornerRadius: 12))
+          } else {
+            Text("Add a final accessibility check before release.")
+              .padding(8).background(.quaternary, in: RoundedRectangle(cornerRadius: 9))
+            if phase == 6 {
+              Label("Send", systemImage: "paperplane.fill")
+                .frame(maxWidth: .infinity).padding(8)
+                .background(.green, in: Capsule())
+            } else {
+              Label("Command sent to Codex", systemImage: "checkmark.circle.fill")
+                .font(.caption).foregroundStyle(.green)
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private var projectPicker: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      Text("Project").font(.headline).frame(maxWidth: .infinity)
+      Label("No project", systemImage: "folder")
+        .padding(10).background(.blue.opacity(0.28), in: RoundedRectangle(cornerRadius: 12))
+      Label("Aurora", systemImage: "folder.fill").padding(10)
+      Label("CodexWatch", systemImage: "folder.fill").padding(10)
+    }
+  }
+
+  private var newTask: some View {
+    ScrollView {
+      VStack(alignment: .leading, spacing: 9) {
+        Text("New task").font(.headline).frame(maxWidth: .infinity)
+        Label(phase >= 11 ? "No project" : "Aurora", systemImage: "folder")
+          .padding(9).background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+        if phase >= 11 {
+          Text("Create a concise release summary for the team.")
+            .lineLimit(2)
+            .font(.body)
+            .padding(7).background(.quaternary, in: RoundedRectangle(cornerRadius: 9))
+          if phase == 11 {
+            Text("Create task").frame(maxWidth: .infinity).padding(8)
+              .background(.green, in: Capsule())
+          } else {
+            Label("Task created in Codex", systemImage: "checkmark.circle.fill")
+              .font(.caption).foregroundStyle(.green)
+          }
+        } else {
+          Label("Dictate request", systemImage: "mic.fill")
+            .frame(maxWidth: .infinity).padding(8).background(.blue, in: Capsule())
+        }
+      }
+    }
+  }
+
+  private func demoCircleButton(_ symbol: String) -> some View {
+    Image(systemName: symbol).font(.title3).frame(width: 42, height: 42)
+      .background(.quaternary, in: Circle())
+  }
+
+  private func demoMessage(_ role: String, _ text: String, _ color: Color) -> some View {
+    VStack(alignment: .leading, spacing: 2) {
+      Text(role).font(.caption2.bold()).foregroundStyle(color)
+      Text(text).font(.caption)
+    }
+    .padding(7).frame(maxWidth: .infinity, alignment: .leading)
+    .background(.quaternary, in: RoundedRectangle(cornerRadius: 9))
+  }
+
+  private func play() async {
+    try? await Task.sleep(for: .seconds(3)); landingTarget = 3
+    try? await Task.sleep(for: .seconds(2)); landingTarget = 7
+    try? await Task.sleep(for: .seconds(3)); landingTarget = 4
+    try? await Task.sleep(for: .seconds(2)); landingTarget = 0
+    try? await Task.sleep(for: .seconds(3)); phase = 3
+    try? await Task.sleep(for: .seconds(3)); phase = 4; conversationTarget = 0
+    try? await Task.sleep(for: .seconds(2)); conversationTarget = 3
+    let remainder: [(Int, Double)] = [
+      (5, 4), (6, 5), (7, 4), (8, 3), (9, 3), (10, 4), (11, 5), (12, 5)
+    ]
+    for (next, seconds) in remainder {
+      try? await Task.sleep(for: .seconds(seconds))
+      guard !Task.isCancelled else { return }
+      withAnimation(.easeInOut(duration: 0.35)) { phase = next }
     }
   }
 }
@@ -50,7 +246,7 @@ struct TaskPickerView: View {
           }
         }
       }
-      .navigationTitle("Tareas")
+      .navigationTitle(relay.isDemoMode ? "Tasks" : "Tareas")
       .navigationDestination(for: CodexTask.self) { task in
         VoiceCommandView(task: task)
       }
@@ -104,7 +300,9 @@ private struct NewTaskView: View {
   }
 
   private var selectedProjectName: String {
-    guard !projectSelection.selectedPath.isEmpty else { return "Sin proyecto" }
+    guard !projectSelection.selectedPath.isEmpty else {
+      return relay.isDemoMode ? "No project" : "Sin proyecto"
+    }
     return URL(fileURLWithPath: projectSelection.selectedPath).lastPathComponent
   }
 
@@ -117,7 +315,7 @@ private struct NewTaskView: View {
 
   var body: some View {
     List {
-      Section("Proyecto") {
+      Section(relay.isDemoMode ? "Project" : "Proyecto") {
         NavigationLink {
           ProjectSelectionView(
             projectPaths: projectPaths,
@@ -134,9 +332,13 @@ private struct NewTaskView: View {
         .accessibilityLabel("Proyecto: \(selectedProjectName)")
       }
 
-      Section("Petición") {
-        TextFieldLink(prompt: Text("Describe la nueva tarea")) {
-          Label(prompt.isEmpty ? "Dictar petición" : "Volver a dictar", systemImage: "mic.fill")
+      Section(relay.isDemoMode ? "Request" : "Petición") {
+        TextFieldLink(prompt: Text(relay.isDemoMode ? "Describe the new task" : "Describe la nueva tarea")) {
+          Label(
+            prompt.isEmpty
+              ? (relay.isDemoMode ? "Dictate request" : "Dictar petición")
+              : (relay.isDemoMode ? "Dictate again" : "Volver a dictar"),
+            systemImage: "mic.fill")
         } onSubmit: {
           prompt = $0.trimmingCharacters(in: .whitespacesAndNewlines)
         }
@@ -148,7 +350,7 @@ private struct NewTaskView: View {
             .padding(8)
             .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
 
-          Button("Crear tarea") {
+          Button(relay.isDemoMode ? "Create task" : "Crear tarea") {
             let projectPath = projectSelection.selectedPath.isEmpty
               ? nil
               : projectSelection.selectedPath
@@ -163,7 +365,7 @@ private struct NewTaskView: View {
       }
 
       if let receipt {
-        Section("Estado") {
+        Section(relay.isDemoMode ? "Status" : "Estado") {
           switch receipt.state {
           case .queued:
             HStack {
@@ -182,7 +384,7 @@ private struct NewTaskView: View {
         }
       }
     }
-    .navigationTitle("Nueva tarea")
+    .navigationTitle(relay.isDemoMode ? "New task" : "Nueva tarea")
     .onAppear {
       projectSelection.initializeIfNeeded(projectPaths: projectPaths)
     }
@@ -212,13 +414,16 @@ private struct NewTaskView: View {
 }
 
 private struct ProjectSelectionView: View {
+  @EnvironmentObject private var relay: WatchRelay
   let projectPaths: [String]
   @Binding var selection: String
   @Environment(\.dismiss) private var dismiss
 
   var body: some View {
     List {
-      projectButton(title: "Sin proyecto", path: "", systemImage: "folder")
+      projectButton(
+        title: relay.isDemoMode ? "No project" : "Sin proyecto",
+        path: "", systemImage: "folder")
       ForEach(projectPaths, id: \.self) { path in
         projectButton(
           title: URL(fileURLWithPath: path).lastPathComponent,
@@ -227,7 +432,7 @@ private struct ProjectSelectionView: View {
         )
       }
     }
-    .navigationTitle("Proyecto")
+    .navigationTitle(relay.isDemoMode ? "Project" : "Proyecto")
   }
 
   private func projectButton(title: String, path: String, systemImage: String) -> some View {
@@ -300,7 +505,7 @@ struct VoiceCommandView: View {
     ScrollViewReader { proxy in
       ScrollView {
         VStack(alignment: .leading, spacing: 10) {
-          Text("Últimos mensajes")
+          Text(relay.isDemoMode ? "Recent messages" : "Últimos mensajes")
             .font(.caption.bold())
             .foregroundStyle(.secondary)
 
@@ -316,7 +521,7 @@ struct VoiceCommandView: View {
                 .font(.caption2)
                 .foregroundStyle(.orange)
             } else {
-              Text("No hay mensajes disponibles")
+              Text(relay.isDemoMode ? "No messages available" : "No hay mensajes disponibles")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
             }
@@ -399,8 +604,12 @@ struct VoiceCommandView: View {
 
   @ViewBuilder
   private var watchDictationComposer: some View {
-    TextFieldLink(prompt: Text("Di la orden que quieres enviar a Codex")) {
-      Label(transcript.isEmpty ? "Dictar orden" : "Volver a dictar", systemImage: "mic.fill")
+    TextFieldLink(prompt: Text(relay.isDemoMode ? "Say what you want Codex to do" : "Di la orden que quieres enviar a Codex")) {
+      Label(
+        transcript.isEmpty
+          ? (relay.isDemoMode ? "Dictate command" : "Dictar orden")
+          : (relay.isDemoMode ? "Dictate again" : "Volver a dictar"),
+        systemImage: "mic.fill")
     } onSubmit: {
       transcript = $0
     }
@@ -412,7 +621,7 @@ struct VoiceCommandView: View {
         .padding(8)
         .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
 
-      Button("Enviar") {
+      Button(relay.isDemoMode ? "Send" : "Enviar") {
         commandID = relay.send(CodexCommand(task: task, text: transcript))
         WKInterfaceDevice.current().play(.click)
       }
@@ -578,11 +787,12 @@ private struct MarqueeTitleWidthKey: PreferenceKey {
 }
 
 private struct ConversationMessageView: View {
+  @EnvironmentObject private var relay: WatchRelay
   let message: CodexMessage
 
   var body: some View {
     VStack(alignment: .leading, spacing: 3) {
-      Text(message.role == .user ? "Tú" : "Codex")
+      Text(message.role == .user ? (relay.isDemoMode ? "You" : "Tú") : "Codex")
         .font(.caption2.bold())
         .foregroundStyle(message.role == .user ? .cyan : .purple)
       Text(verbatim: message.text)
@@ -614,6 +824,7 @@ final class WatchRelay: NSObject, ObservableObject {
   @Published private(set) var transcriptionModel: OpenAITranscriptionModel = .gptTranscribe
 
   private let session: WCSession? = WCSession.isSupported() ? .default : nil
+  let isDemoMode = ProcessInfo.processInfo.arguments.contains("--codexwatch-demo")
   private var lastQueuedTaskRequest: Date?
   private var latestTasksRevision = UserDefaults.standard.double(forKey: "latestTasksRevision")
   private var conversationRevisions: [String: Date] = [:]
@@ -621,6 +832,10 @@ final class WatchRelay: NSObject, ObservableObject {
 
   private override init() {
     super.init()
+    if isDemoMode {
+      prepareDemo()
+      return
+    }
     guard let data = UserDefaults.standard.data(forKey: Self.cachedConversationsKey),
       let cached = try? CodexWatchWire.decode([String: CachedConversation].self, from: data)
     else { return }
@@ -629,6 +844,7 @@ final class WatchRelay: NSObject, ObservableObject {
   }
 
   func start() {
+    guard !isDemoMode else { return }
     guard session?.delegate == nil else { return }
     session?.delegate = self
     session?.activate()
@@ -648,8 +864,26 @@ final class WatchRelay: NSObject, ObservableObject {
     commandReceipts[command.id] = CommandReceipt(
       commandID: command.id,
       state: .queued,
-      message: "Enviando al Mac…"
+      message: isDemoMode ? "Sending to Codex…" : "Enviando al Mac…"
     )
+    if isDemoMode {
+      Task { [weak self] in
+        try? await Task.sleep(for: .milliseconds(850))
+        guard let self else { return }
+        conversations[command.taskID, default: []].append(CodexMessage(
+          id: "demo-user-\(command.id.uuidString)",
+          role: .user,
+          text: command.text,
+          createdAt: Date()
+        ))
+        commandReceipts[command.id] = CommandReceipt(
+          commandID: command.id,
+          state: .sent,
+          message: "Command sent to Codex"
+        )
+      }
+      return command.id
+    }
     guard let data = try? CodexWatchWire.encode(command),
           let session,
           session.activationState == .activated else {
@@ -686,8 +920,36 @@ final class WatchRelay: NSObject, ObservableObject {
     commandReceipts[command.id] = CommandReceipt(
       commandID: command.id,
       state: .queued,
-      message: "Creando en Codex…"
+      message: isDemoMode ? "Creating in Codex…" : "Creando en Codex…"
     )
+    if isDemoMode {
+      Task { [weak self] in
+        try? await Task.sleep(for: .milliseconds(900))
+        guard let self else { return }
+        let task = CodexTask(
+          id: "demo-new-\(command.id.uuidString)",
+          title: command.prompt,
+          preview: command.prompt,
+          projectPath: command.projectPath,
+          updatedAt: Date(),
+          state: .working
+        )
+        tasks.insert(task, at: 0)
+        conversations[task.id] = [CodexMessage(
+          id: "demo-new-message-\(command.id.uuidString)",
+          role: .user,
+          text: command.prompt,
+          createdAt: Date()
+        )]
+        conversationRevisions[task.id] = task.updatedAt
+        commandReceipts[command.id] = CommandReceipt(
+          commandID: command.id,
+          state: .sent,
+          message: "Task created in Codex"
+        )
+      }
+      return command.id
+    }
     guard let data = try? CodexWatchWire.encode(command),
           let session,
           session.activationState == .activated else {
@@ -741,6 +1003,7 @@ final class WatchRelay: NSObject, ObservableObject {
   }
 
   func refreshReceipt(_ commandID: UUID) {
+    guard !isDemoMode else { return }
     guard let session, session.activationState == .activated, session.isReachable else { return }
     let replyHandler = WatchReceiptReplyHandler(commandID: commandID)
     session.sendMessage(
@@ -752,6 +1015,15 @@ final class WatchRelay: NSObject, ObservableObject {
 
   func refreshTasks() {
     guard !isRefreshingTasks else { return }
+    if isDemoMode {
+      isRefreshingTasks = true
+      taskRefreshError = nil
+      Task { [weak self] in
+        try? await Task.sleep(for: .milliseconds(650))
+        self?.isRefreshingTasks = false
+      }
+      return
+    }
     guard let session, session.activationState == .activated else {
       taskRefreshError = "Conectando con el iPhone…"
       return
@@ -792,6 +1064,7 @@ final class WatchRelay: NSObject, ObservableObject {
   }
 
   func loadConversationIfNeeded(for taskID: String, updatedAt revision: Date) {
+    if isDemoMode { return }
     if let loadedRevision = conversationRevisions[taskID], loadedRevision >= revision { return }
     guard !loadingConversations.contains(taskID) else { return }
     guard let session, session.isReachable else {
@@ -893,6 +1166,77 @@ final class WatchRelay: NSObject, ObservableObject {
     }
     if let modelRawValue, let model = OpenAITranscriptionModel(rawValue: modelRawValue) {
       transcriptionModel = model
+    }
+  }
+
+  private func prepareDemo() {
+    let now = Date()
+    tasks = [
+      CodexTask(
+        id: "demo-launch", title: "Prepare the Aurora launch",
+        preview: "Review the launch plan and the remaining blockers.",
+        projectPath: "/Demo/Aurora", updatedAt: now.addingTimeInterval(-45), state: .working),
+      CodexTask(
+        id: "demo-design", title: "Polish the iPhone onboarding",
+        preview: "Simplify connection and status messages.",
+        projectPath: "/Demo/CodexWatch", updatedAt: now.addingTimeInterval(-180), state: .idle),
+      CodexTask(
+        id: "demo-research", title: "Weekly trends briefing",
+        preview: "Prepare five actionable takeaways.",
+        projectPath: "/Demo/Research", updatedAt: now.addingTimeInterval(-420), state: .needsAttention),
+      CodexTask(
+        id: "demo-podcast", title: "Episode 12 script",
+        preview: "Turn the notes into a twenty-minute outline.",
+        projectPath: "/Demo/Studio", updatedAt: now.addingTimeInterval(-900), state: .idle),
+      CodexTask(
+        id: "demo-dashboard", title: "August executive dashboard",
+        preview: "Add metrics and prepare the mobile view.",
+        projectPath: "/Demo/Analytics", updatedAt: now.addingTimeInterval(-1_800), state: .working),
+      CodexTask(
+        id: "demo-security", title: "Companion security review",
+        preview: "Check transport, tokens and network exposure.",
+        projectPath: "/Demo/CodexWatch", updatedAt: now.addingTimeInterval(-3_600), state: .idle),
+      CodexTask(
+        id: "demo-ideas", title: "Ideas for the next release",
+        preview: "Prioritize improvements for Watch and Vision Pro.",
+        projectPath: nil, updatedAt: now.addingTimeInterval(-7_200), state: .idle),
+      CodexTask(
+        id: "demo-copy", title: "Public website copy",
+        preview: "Give the product story a sharper voice.",
+        projectPath: "/Demo/Website", updatedAt: now.addingTimeInterval(-10_800), state: .idle)
+    ]
+
+    conversations["demo-launch"] = [
+      CodexMessage(
+        id: "demo-launch-1", role: .user,
+        text: "Is the beta launch plan ready?",
+        createdAt: now.addingTimeInterval(-420)),
+      CodexMessage(
+        id: "demo-launch-2", role: .assistant,
+        text: "Yes. The build passed every test and deployment is ready.",
+        createdAt: now.addingTimeInterval(-360)),
+      CodexMessage(
+        id: "demo-launch-3", role: .user,
+        text: "Please verify the complete experience from the Watch as well.",
+        createdAt: now.addingTimeInterval(-240)),
+      CodexMessage(
+        id: "demo-launch-4", role: .assistant,
+        text: "Done. Navigation, dictation, sending and task creation all work correctly.",
+        createdAt: now.addingTimeInterval(-120))
+    ]
+    for task in tasks {
+      conversationRevisions[task.id] = task.updatedAt
+      if conversations[task.id] == nil {
+        conversations[task.id] = [
+          CodexMessage(
+            id: "\(task.id)-1", role: .user, text: task.preview,
+            createdAt: task.updatedAt.addingTimeInterval(-90)),
+          CodexMessage(
+            id: "\(task.id)-2", role: .assistant,
+            text: "Understood. I am working on it and will let you know when it is ready.",
+            createdAt: task.updatedAt)
+        ]
+      }
     }
   }
 }

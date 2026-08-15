@@ -237,9 +237,12 @@ final class PhoneRelay: NSObject, ObservableObject {
     private let session: WCSession? = WCSession.isSupported() ? .default : nil
     private var pollingTask: Task<Void, Never>?
     private var receiptPollingTasks: [UUID: Task<Void, Never>] = [:]
+    private var conversationFetchTasks: [String: Task<CodexConversation, Error>] = [:]
+    private var conversationBreakers: [String: OperationCircuitBreaker] = [:]
     private var activeBridgeURL: String?
     private var tasksRevision: TimeInterval = 0
     private var hasLoadedTasks = false
+    private var refreshInProgress = false
     private var lastDurableTasksData: Data?
     private var lastDurableVoiceInputMode: String?
     private var lastDurableTranscriptionModel: String?
@@ -331,6 +334,9 @@ final class PhoneRelay: NSObject, ObservableObject {
     }
 
     func refreshTasks() async {
+        guard !refreshInProgress else { return }
+        refreshInProgress = true
+        defer { refreshInProgress = false }
         guard !accessToken.isEmpty else {
             statusMessage = "Pega el token mostrado por el puente del Mac"
             isConnected = false
@@ -416,24 +422,50 @@ final class PhoneRelay: NSObject, ObservableObject {
     }
 
     private func fetchConversation(taskID: String) async throws -> CodexConversation {
+        var breaker = conversationBreakers[taskID] ?? OperationCircuitBreaker()
+        guard breaker.allowsOperation() else {
+            conversationBreakers[taskID] = breaker
+            throw NSError(
+                domain: "CodexWatch",
+                code: 503,
+                userInfo: [NSLocalizedDescriptionKey: "Recuperación detenida temporalmente; vuelve a intentarlo en un minuto"]
+            )
+        }
+        if let existing = conversationFetchTasks[taskID] {
+            return try await existing.value
+        }
         let candidates = [activeBridgeURL, configuredBridgeURL]
             .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
             .reduce(into: [String]()) { result, candidate in
                 if !result.contains(candidate) { result.append(candidate) }
             }
-        var lastError: Error?
-        for candidate in candidates {
-            do {
-                let conversation = try await MacBridgeClient(baseURL: candidate, token: accessToken)
-                    .fetchConversation(taskID: taskID)
-                activeBridgeURL = candidate
-                return conversation
-            } catch {
-                lastError = error
+        let token = accessToken
+        let fetch = Task<CodexConversation, Error> {
+            var lastError: Error?
+            for candidate in candidates {
+                do {
+                    return try await MacBridgeClient(baseURL: candidate, token: token)
+                        .fetchConversation(taskID: taskID)
+                } catch {
+                    lastError = error
+                }
             }
+            throw lastError ?? URLError(.cannotConnectToHost)
         }
-        throw lastError ?? URLError(.cannotConnectToHost)
+        conversationFetchTasks[taskID] = fetch
+        defer { conversationFetchTasks[taskID] = nil }
+        do {
+            let conversation = try await fetch.value
+            breaker.recordSuccess()
+            conversationBreakers[taskID] = breaker
+            if let configuredBridgeURL { activeBridgeURL = configuredBridgeURL }
+            return conversation
+        } catch {
+            breaker.recordFailure()
+            conversationBreakers[taskID] = breaker
+            throw error
+        }
     }
 
     private func submit(_ command: CodexCommand) async -> CommandReceipt {
@@ -535,9 +567,14 @@ final class PhoneRelay: NSObject, ObservableObject {
         let commandID = receipt.commandID
         receiptPollingTasks[commandID] = Task { [weak self] in
             defer { self?.receiptPollingTasks[commandID] = nil }
-            for _ in 0..<600 {
+            let delays: [Duration] = [
+                .seconds(3), .seconds(5), .seconds(8), .seconds(13),
+                .seconds(20), .seconds(30), .seconds(30), .seconds(30)
+            ]
+            var consecutiveErrors = 0
+            for delay in delays {
                 do {
-                    try await Task.sleep(for: .seconds(3))
+                    try await Task.sleep(for: delay)
                 } catch {
                     return
                 }
@@ -546,6 +583,7 @@ final class PhoneRelay: NSObject, ObservableObject {
                 do {
                     let updated = try await MacBridgeClient(baseURL: baseURL, token: accessToken)
                         .fetchReceipt(commandID: commandID)
+                    consecutiveErrors = 0
                     sendReceiptToWatch(updated)
                     switch updated.state {
                     case .queued:
@@ -559,10 +597,11 @@ final class PhoneRelay: NSObject, ObservableObject {
                         return
                     }
                 } catch {
-                    // The bridge owns the durable in-memory retry. A temporary
-                    // phone/network failure must not turn the queued order into
-                    // a false failure on the Watch.
-                    continue
+                    consecutiveErrors += 1
+                    if consecutiveErrors >= 3 {
+                        statusMessage = "Consulta detenida para no saturar el puente"
+                        return
+                    }
                 }
             }
         }
@@ -892,6 +931,8 @@ private struct MacBridgeClient: Sendable {
             CodexWatchWire.companionHTTPIdentifier,
             forHTTPHeaderField: CodexWatchWire.companionHTTPHeader
         )
+        request.setValue(UUID().uuidString, forHTTPHeaderField: CodexWatchWire.correlationHTTPHeader)
+        request.setValue("iphone-companion", forHTTPHeaderField: CodexWatchWire.originHTTPHeader)
         return request
     }
 

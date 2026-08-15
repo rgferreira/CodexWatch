@@ -97,7 +97,12 @@ final class LocalHTTPServer: @unchecked Sendable {
         allowedNetwork = hostAddress & mask
         self.handler = handler
 
-        listener = try NWListener(using: .tcp, on: nwPort)
+        let parameters = NWParameters.tcp
+        parameters.requiredLocalEndpoint = .hostPort(
+            host: NWEndpoint.Host(allowedIPv4Address),
+            port: nwPort
+        )
+        listener = try NWListener(using: parameters)
         listener.stateUpdateHandler = { state in
             switch state {
             case .ready:
@@ -180,18 +185,11 @@ final class LocalHTTPServer: @unchecked Sendable {
     private func isAllowedPrivatePeer(_ endpoint: NWEndpoint) -> Bool {
         guard case .hostPort(let host, _) = endpoint,
               let candidate = Self.ipv4Value(String(describing: host)) else { return false }
-        return candidate & allowedMask == allowedNetwork || Self.isPrivateOrLoopback(candidate)
+        return candidate & allowedMask == allowedNetwork || Self.isLoopback(candidate)
     }
 
-    private static func isPrivateOrLoopback(_ value: UInt32) -> Bool {
-        let first = UInt8((value >> 24) & 0xff)
-        let second = UInt8((value >> 16) & 0xff)
-        if first == 10 || first == 127 { return true }
-        if first == 172, (16...31).contains(second) { return true }
-        if first == 192, second == 168 { return true }
-        if first == 100, (64...127).contains(second) { return true }
-        if first == 169, second == 254 { return true }
-        return false
+    private static func isLoopback(_ value: UInt32) -> Bool {
+        UInt8((value >> 24) & 0xff) == 127
     }
 
     private static func ipv4Value(_ value: String) -> UInt32? {

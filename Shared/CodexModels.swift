@@ -107,6 +107,99 @@ enum BridgeConnectionState: Equatable, Sendable {
     }
 }
 
+struct OperationCircuitBreaker: Sendable {
+    private(set) var consecutiveFailures = 0
+    private(set) var openUntil: Date?
+    let failureThreshold: Int
+    let cooldown: TimeInterval
+
+    init(failureThreshold: Int = 3, cooldown: TimeInterval = 60) {
+        self.failureThreshold = failureThreshold
+        self.cooldown = cooldown
+    }
+
+    mutating func allowsOperation(at now: Date = Date()) -> Bool {
+        guard let openUntil else { return true }
+        if now >= openUntil {
+            self.openUntil = nil
+            consecutiveFailures = 0
+            return true
+        }
+        return false
+    }
+
+    mutating func recordSuccess() {
+        consecutiveFailures = 0
+        openUntil = nil
+    }
+
+    mutating func recordFailure(at now: Date = Date()) {
+        consecutiveFailures += 1
+        if consecutiveFailures >= failureThreshold {
+            openUntil = now.addingTimeInterval(cooldown)
+        }
+    }
+}
+
+struct BridgeOperationSafety: Sendable {
+    enum BeginResult: Equatable {
+        case started
+        case duplicate(CommandReceipt)
+        case threadBusy
+        case circuitOpen
+    }
+
+    private var activeWrites: [String: UUID] = [:]
+    private var receipts: [UUID: CommandReceipt] = [:]
+    private var breakers: [String: OperationCircuitBreaker] = [:]
+
+    mutating func beginWrite(
+        commandID: UUID,
+        threadID: String,
+        now: Date = Date()
+    ) -> BeginResult {
+        if let receipt = receipts[commandID] { return .duplicate(receipt) }
+        if activeWrites[threadID] == commandID {
+            return .duplicate(CommandReceipt(
+                commandID: commandID,
+                state: .queued,
+                message: "Operación en curso"
+            ))
+        }
+        if activeWrites[threadID] != nil { return .threadBusy }
+        var breaker = breakers[threadID] ?? OperationCircuitBreaker()
+        guard breaker.allowsOperation(at: now) else {
+            breakers[threadID] = breaker
+            return .circuitOpen
+        }
+        breakers[threadID] = breaker
+        activeWrites[threadID] = commandID
+        return .started
+    }
+
+    mutating func finishWrite(
+        threadID: String,
+        receipt: CommandReceipt,
+        now: Date = Date()
+    ) {
+        if activeWrites[threadID] == receipt.commandID {
+            activeWrites.removeValue(forKey: threadID)
+        }
+        receipts[receipt.commandID] = receipt
+        var breaker = breakers[threadID] ?? OperationCircuitBreaker()
+        if receipt.state == .failed { breaker.recordFailure(at: now) }
+        else if receipt.state == .sent { breaker.recordSuccess() }
+        breakers[threadID] = breaker
+        if receipts.count > 100, let oldest = receipts.keys.first {
+            receipts.removeValue(forKey: oldest)
+        }
+    }
+
+    func hasActiveWrite(for threadID: String) -> Bool {
+        activeWrites[threadID] != nil
+    }
+}
+
 enum VoiceInputMode: String, Codable, CaseIterable, Identifiable, Sendable {
     case watchDictation
     case openAIAPI
@@ -194,6 +287,8 @@ struct CommandReceipt: Codable, Hashable, Sendable {
 enum CodexWatchWire {
     static let companionHTTPHeader = "x-codexwatch-client"
     static let companionHTTPIdentifier = "iphone-companion"
+    static let correlationHTTPHeader = "x-codexwatch-correlation-id"
+    static let originHTTPHeader = "x-codexwatch-origin"
     static let tasks = "codexwatch.tasks"
     static let tasksRequest = "codexwatch.tasks.request"
     static let tasksResponse = "codexwatch.tasks.response"

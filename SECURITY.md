@@ -2,11 +2,11 @@
 
 ## Modelo de exposición
 
-Codex Watch Bridge está diseñado para redes privadas: VPN como ZeroTier, Tailscale o WireGuard, y una LAN de confianza. No debe publicarse el puerto HTTP `48720` mediante NAT, port forwarding ni túneles públicos.
+Codex Watch Bridge está diseñado para redes privadas: VPN como ZeroTier, Tailscale o WireGuard. El listener se vincula exclusivamente a la IPv4 privada seleccionada y rechaza pares ajenos a su subred; no escucha en Wi-Fi/LAN ni debe publicarse el puerto HTTP `48720` mediante NAT, port forwarding o túneles públicos.
 
-En una VPN cifrada, el tráfico HTTP queda protegido por ese transporte. En una LAN, el token autentica al cliente pero el contenido HTTP no está cifrado; úsala solo si la red es de confianza. Para un dominio o una IP pública, el Companion exige HTTPS y debe colocarse un proxy TLS seguro delante del bridge. Todos los equipos de la misma red privada deben considerarse capaces de intentar conectar con él.
+En una VPN cifrada, el tráfico HTTP queda protegido por ese transporte. Para un dominio o una IP pública, el Companion exige HTTPS y debe colocarse un proxy TLS seguro delante del bridge. Todos los equipos de la misma subred VPN deben considerarse capaces de intentar conectar con él.
 
-El socket puede aparecer como listener global en herramientas del sistema. El bridge cancela antes de leer datos cualquier conexión cuyo origen no sea loopback, una IPv4 privada/CGNAT/link-local o el CIDR asignado por ZeroTier; después aplica el token y el rate limiting.
+El bridge vincula el socket a la dirección VPN detectada y cancela antes de leer datos cualquier conexión cuyo origen no sea loopback o el CIDR asignado; después aplica el token y el rate limiting.
 
 ## Datos sensibles
 
