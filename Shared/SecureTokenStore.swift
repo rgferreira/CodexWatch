@@ -1,4 +1,5 @@
 import Foundation
+import LocalAuthentication
 import Security
 
 enum SecureTokenStore {
@@ -20,12 +21,15 @@ enum SecureTokenStore {
     }
 
     static func load(service: String, account: String) throws -> String? {
+        let authenticationContext = LAContext()
+        authenticationContext.interactionNotAllowed = true
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
             kSecAttrAccount: account,
             kSecMatchLimit: kSecMatchLimitOne,
-            kSecReturnData: true
+            kSecReturnData: true,
+            kSecUseAuthenticationContext: authenticationContext
         ]
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)

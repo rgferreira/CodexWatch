@@ -126,6 +126,10 @@ final class BridgeController: ObservableObject {
     private var readBreakers: [String: OperationCircuitBreaker] = [:]
     private static let companionContactTimeout: TimeInterval = 45
 
+    private static func audit(_ message: String) {
+        FileHandle.standardError.write(Data((message + "\n").utf8))
+    }
+
     private struct PendingDelivery {
         let command: CodexCommand
         let successMessage: String
@@ -134,18 +138,28 @@ final class BridgeController: ObservableObject {
     }
 
     init() {
+        Self.audit("codexwatch_controller_initializing")
         UserDefaults.standard.removeObject(forKey: "pairingCode")
         do {
             accessToken = try SecureTokenStore.loadOrCreate(
                 service: Self.tokenService,
                 account: Self.tokenAccount
             )
-            hasOpenAIAPIKey = try SecureTokenStore.load(
-                service: Self.openAIKeyService,
-                account: Self.openAIKeyAccount
-            ) != nil
+            Self.audit("codexwatch_access_token_ready")
+            do {
+                hasOpenAIAPIKey = try SecureTokenStore.load(
+                    service: Self.openAIKeyService,
+                    account: Self.openAIKeyAccount
+                ) != nil
+            } catch {
+                hasOpenAIAPIKey = false
+                Self.logger.warning("La clave opcional de transcripción requiere acceso interactivo al llavero")
+            }
+            Self.audit("codexwatch_secure_state_ready")
         } catch {
             status = "No se pudo acceder al llavero: \(error.localizedDescription)"
+            Self.logger.error("No se pudo cargar el estado seguro del Bridge: \(error.localizedDescription, privacy: .public)")
+            print("codexwatch_secure_state_error type=\(type(of: error))")
         }
         Task { await start() }
     }
@@ -202,6 +216,7 @@ final class BridgeController: ObservableObject {
     }
 
     private func start() async {
+        Self.audit("codexwatch_start_requested")
         guard !accessToken.isEmpty else { return }
         startConnectionMonitor()
         retryTask?.cancel()
@@ -210,6 +225,7 @@ final class BridgeController: ObservableObject {
             while !Task.isCancelled {
                 do {
                     try appServer.start()
+                    Self.audit("codexwatch_relay_controller_token_ready")
                     if httpServer == nil {
                         let network = try? ZeroTierAddressDetector.activeIPv4Network()
                         httpServer = try LocalHTTPServer(allowedIPv4Address: network?.address ?? "127.0.0.1", prefixLength: network?.prefixLength ?? 32, port: 48720, onStateChange: { [weak self] ready, error in
@@ -226,12 +242,15 @@ final class BridgeController: ObservableObject {
                             guard let self else { return .serverError() }
                             return await self.handle(request)
                         }
+                        Self.audit("codexwatch_http_server_created")
                     }
                     await refreshTasks()
                 } catch {
                     status = "Reintentando la conexión con Codex…"
                     isCodexReady = false
                     updateReadiness(preserveStatus: true)
+                    Self.logger.error("Fallo al conectar con Relay Codex Controller: \(error.localizedDescription, privacy: .public)")
+                    print("codexwatch_controller_error type=\(type(of: error)) detail=\(error.localizedDescription)")
                 }
                 try? await Task.sleep(for: .seconds(10))
             }
@@ -505,12 +524,21 @@ final class BridgeController: ObservableObject {
     ) async -> CommandReceipt {
         let receipt: CommandReceipt
         do {
-            try await appServer.send(delivery.command)
-            receipt = CommandReceipt(
-                commandID: delivery.command.id,
-                state: .sent,
-                message: delivery.successMessage
-            )
+            let disposition = try await appServer.send(delivery.command)
+            switch disposition {
+            case .completed:
+                receipt = CommandReceipt(
+                    commandID: delivery.command.id,
+                    state: .sent,
+                    message: delivery.successMessage
+                )
+            case .queued:
+                receipt = CommandReceipt(
+                    commandID: delivery.command.id,
+                    state: .queued,
+                    message: "Orden aceptada; esperando disponibilidad de la tarea"
+                )
+            }
         } catch {
             receipt = CommandReceipt(
                 commandID: delivery.command.id,
@@ -525,10 +553,58 @@ final class BridgeController: ObservableObject {
             threadID: delivery.command.taskID,
             operation: operation,
             origin: delivery.origin,
-            result: receipt.state == .sent ? "success" : "failed",
+            result: receipt.state == .sent ? "success" : (receipt.state == .queued ? "queued" : "failed"),
             duration: Date().timeIntervalSince(started)
         )
+        if receipt.state == .queued {
+            Task { [weak self] in
+                await self?.monitorQueuedCommand(delivery)
+            }
+        }
         return receipt
+    }
+
+    private func monitorQueuedCommand(_ delivery: PendingDelivery) async {
+        for _ in 0..<360 {
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            guard !Task.isCancelled else { return }
+            do {
+                let status = try await appServer.operationStatus(
+                    for: delivery.command.id
+                )
+                if status == "queued" { continue }
+                if status == "running" {
+                    remember(CommandReceipt(
+                        commandID: delivery.command.id,
+                        state: .queued,
+                        message: "Orden aceptada; procesando"
+                    ))
+                    continue
+                }
+                let receipt: CommandReceipt
+                if status == "completed" {
+                    receipt = CommandReceipt(
+                        commandID: delivery.command.id,
+                        state: .sent,
+                        message: delivery.successMessage
+                    )
+                } else {
+                    receipt = CommandReceipt(
+                        commandID: delivery.command.id,
+                        state: .failed,
+                        message: "Relay no pudo completar la orden aceptada"
+                    )
+                }
+                operationSafety.finishWrite(
+                    threadID: delivery.command.taskID,
+                    receipt: receipt
+                )
+                remember(receipt)
+                return
+            } catch {
+                continue
+            }
+        }
     }
 
     private func telemetryResult(for error: Error) -> String {

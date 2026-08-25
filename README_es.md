@@ -14,7 +14,8 @@ Aplicación experimental para seleccionar una tarea reciente de Codex desde el A
 
 - `CodexWatch`: app compañera para iPhone y enlace con WatchConnectivity.
 - `CodexWatch Watch App`: selector cronológico, lectura de mensajes, dictado o grabación y envío de órdenes.
-- `CodexWatchBridge`: puente local autenticado que habla con `codex app-server`.
+- `CodexWatchBridge`: puente local autenticado que consume el `CodexController`
+  loopback de Relay y no posee un proceso App Server ni un writer propio.
 
 El puente detecta ZeroTier y vincula el listener exclusivamente a esa IPv4 y su CIDR. Exige el token de acceso mostrado por la aplicación de macOS y no publica Bonjour.
 
@@ -22,7 +23,7 @@ El icono de la barra de menús representa la conexión extremo a extremo: verde 
 
 La lista del Watch pide una copia fresca al abrirse y cada 10 segundos mientras permanece visible. La petición de WatchConnectivity despierta a la app compañera del iPhone, que consulta el bridge y responde directamente al reloj; además, el iPhone actualiza su copia cada 15 segundos mientras la app puede ejecutarse. Cada cambio se envía también como instantánea persistente, versionada y deduplicada: el reloj recibe la lista más nueva aunque el mensaje inmediato falle y descarta entregas antiguas. El iPhone conserva la última lista válida para no borrar el reloj con una caché vacía al reactivarse en segundo plano.
 
-El icono `+` de la esquina superior de la lista permite crear una tarea nueva. El reloj propone el proyecto de la tarea más reciente, permite elegir otro proyecto o ninguno, recoge la petición mediante dictado y envía al bridge un `thread/start` seguido del primer `turn/start`.
+El icono `+` de la esquina superior de la lista permite crear una tarea nueva. El reloj propone el proyecto de la tarea más reciente, permite elegir otro proyecto o ninguno, recoge la petición mediante dictado y envía al Controller de Relay una única operación de dominio idempotente.
 
 ## Órdenes de voz
 
@@ -33,7 +34,7 @@ La app compañera ofrece dos rutas:
 
 El Companion permite seleccionar cualquiera de los seis modelos de transcripción de ficheros admitidos: `gpt-transcribe`, `gpt-4o-transcribe`, `gpt-4o-mini-transcribe`, `gpt-4o-mini-transcribe-2025-12-15`, `gpt-4o-transcribe-diarize` y `whisper-1`. La API key se configura en Codex Watch Bridge y se guarda únicamente en el llavero del Mac.
 
-Si Codex Desktop ya es propietario de la tarea seleccionada, el bridge entrega la orden al proceso propietario mediante el canal IPC local y privado de Codex. Si la tarea todavía no está activa en Desktop, el bridge la abre por su enlace `codex://`, espera brevemente a que registre su propietario y entrega entonces la orden con un identificador idempotente. El Watch solo muestra éxito cuando Codex acepta el turno y muestra un error final, en vez de una espera indefinida, si Desktop no logra activarlo.
+El bridge entrega toda escritura al Controller loopback de Relay con un identificador idempotente. Relay se ocupa del orden por thread, del lifecycle de App Server, de la interrupción acotada y de la terminación. El Watch solo muestra éxito cuando Relay confirma el `turn/completed` final.
 
 ## Fuera de casa
 
@@ -55,8 +56,8 @@ La superficie y las limitaciones conocidas se documentan en [SECURITY.md](SECURI
 
 ## Puente del Mac
 
-La compilación activa puede instalarse en `~/Applications/CodexWatchBridge.app`. Un LaunchAgent local puede iniciarla al abrir sesión. El icono rojo indica que Codex o el servidor privado no están listos, el naranja que el Mac está preparado pero todavía no ha respondido recientemente al Companion, y el verde confirma una respuesta autenticada reciente al iPhone. El endpoint `/health` solo acepta orígenes de red privada y requiere el token.
+La compilación activa puede instalarse en `~/Applications/CodexWatchBridge.app`. Un LaunchAgent local puede iniciarla al abrir sesión. Las actualizaciones deben conservar el mismo Team ID de firma para mantener el acceso no interactivo a las entradas existentes del llavero. El icono rojo indica que Codex o el servidor privado no están listos, el naranja que el Mac está preparado pero todavía no ha respondido recientemente al Companion, y el verde confirma una respuesta autenticada reciente al iPhone. El endpoint `/health` solo acepta orígenes de red privada y requiere el token.
 
 ## Seguridad de conversaciones
 
-Listar tareas y abrir mensajes son operaciones estrictamente de solo lectura y nunca reanudan un hilo. Solo una acción explícita de enviar o crear puede escribir. Los comandos se deduplican por UUID, se serializan por hilo y dejan de reintentarse temporalmente después de tres fallos. Las escrituras a tareas existentes se entregan al propietario activo de Codex Desktop mediante una conexión efímera; el puente no adquiere propiedad persistente del hilo. Véase [el informe del incidente del 15-08-2026](docs/INCIDENT-2026-08-15.md).
+Listar tareas y abrir mensajes son operaciones estrictamente de solo lectura y nunca reanudan un hilo. Solo una acción explícita de enviar o crear puede escribir. Los comandos se deduplican por UUID y Relay los serializa por hilo. El bridge no contiene ningún writer de App Server ni de IPC de Desktop. Véase [el informe del incidente del 15-08-2026](docs/INCIDENT-2026-08-15.md).
