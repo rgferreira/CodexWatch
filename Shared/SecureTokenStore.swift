@@ -21,6 +21,14 @@ enum SecureTokenStore {
     }
 
     static func load(service: String, account: String) throws -> String? {
+        guard let data = try loadData(service: service, account: account) else { return nil }
+        guard let value = String(data: data, encoding: .utf8), !value.isEmpty else {
+            throw StoreError.invalidStoredValue
+        }
+        return value
+    }
+
+    static func loadData(service: String, account: String) throws -> Data? {
         let authenticationContext = LAContext()
         authenticationContext.interactionNotAllowed = true
         let query: [CFString: Any] = [
@@ -35,22 +43,25 @@ enum SecureTokenStore {
         let status = SecItemCopyMatching(query as CFDictionary, &result)
         if status == errSecItemNotFound { return nil }
         guard status == errSecSuccess else { throw StoreError.keychain(status) }
-        guard let data = result as? Data,
-              let value = String(data: data, encoding: .utf8),
-              !value.isEmpty else {
+        guard let data = result as? Data, !data.isEmpty else {
             throw StoreError.invalidStoredValue
         }
-        return value
+        return data
     }
 
     static func save(_ value: String, service: String, account: String) throws {
+        try saveData(Data(value.utf8), service: service, account: account)
+    }
+
+    static func saveData(_ value: Data, service: String, account: String) throws {
+        guard !value.isEmpty else { throw StoreError.invalidStoredValue }
         let identity: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
             kSecAttrAccount: account
         ]
         let attributes: [CFString: Any] = [
-            kSecValueData: Data(value.utf8),
+            kSecValueData: value,
             kSecAttrAccessible: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         ]
         let status = SecItemUpdate(identity as CFDictionary, attributes as CFDictionary)
@@ -60,6 +71,18 @@ enum SecureTokenStore {
             let addStatus = SecItemAdd(item as CFDictionary, nil)
             guard addStatus == errSecSuccess else { throw StoreError.keychain(addStatus) }
         } else if status != errSecSuccess {
+            throw StoreError.keychain(status)
+        }
+    }
+
+    static func delete(service: String, account: String) throws {
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: service,
+            kSecAttrAccount: account
+        ]
+        let status = SecItemDelete(query as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
             throw StoreError.keychain(status)
         }
     }

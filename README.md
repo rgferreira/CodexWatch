@@ -42,6 +42,16 @@ In the iPhone app, configure the connection method, the Mac's IP address or host
 
 For use away from home, the active bridge configuration uses the Mac's detected private ZeroTier IP address. The client supports other private destinations, but the service must be bound explicitly to the corresponding interface; it does not automatically open on Wi-Fi/LAN. A domain name or public IP address requires HTTPS and a secure proxy. The bridge's HTTP port `48720` must never be exposed directly to the Internet.
 
+### Independent Watch transport (in development)
+
+An iPhone-independent path is being built as an end-to-end encrypted, blind
+HTTPS mailbox with outbound-only connections from Watch and Mac. It preserves
+the same command UUID and still terminates in Relay's loopback Controller. No
+public mailbox is provisioned yet, so this path is not enabled in the production
+app and the iPhone route remains the fallback. The protocol, threat boundary,
+mock validation and rollback are documented in
+[Independent Watch transport](docs/HTTPS-MAILBOX-TRANSPORT.md).
+
 ## Security controls
 
 - Listener bound to the IPv4 address reported by `zerotier-cli`, with an allowlist covering its CIDR and loopback; any other source is rejected before request data is read.
