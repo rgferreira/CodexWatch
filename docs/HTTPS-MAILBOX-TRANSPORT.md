@@ -1,8 +1,10 @@
 # Independent Watch transport
 
-Status: protocol and first text slice validated against a local mock. No public
-mailbox is provisioned and the feature is not enabled in production. The stable
-rollback point remains `codexwatch-v0.6-build28-stable` (`5fd8d18`).
+Status: protocol and first text slice validated locally and against the deployed
+Cloudflare Worker. The pilot mailbox and its first pairing were provisioned on
+2026-08-26. Build 0.7/29 adds verified pairing and direct Watch-to-Mac text
+commands; the stable rollback point remains `codexwatch-v0.6-build28-stable`
+(`5fd8d18`).
 
 ## Decision record
 
@@ -11,11 +13,9 @@ Apple Personal Team cannot use the iCloud capability. The CloudKit client and
 entitlements were removed before release. Unsigned compilation is not treated as
 evidence that CloudKit can ship.
 
-The selected design is a separate blind HTTPS mailbox owned by Relay. Relay's
-current repository has no public deploy target, so the production service must
-be provisioned separately before CodexWatch can enable this path. The agreed
+The selected design is a separate blind HTTPS mailbox owned by Relay. Its pilot
 runtime is a Cloudflare Worker with one SQLite Durable Object per pairing. The
-base URL is configuration, never a fabricated or hard-coded hostname.
+base URL remains secure configuration rather than a value compiled into the app.
 
 ## Purpose and authority
 
@@ -102,14 +102,14 @@ source of truth.
 - queued receipt, Controller-terminal reconciliation and distinct receipt IDs;
 - journal restart recovery and file mode 0600;
 - signed macOS build after removal of the unsupported CloudKit entitlement.
+- live encrypted upload, claim, decrypt and ACK against the deployed Worker.
 
 The HTTP client is exercised against `Tests/mock_mailbox_server.py`; the mock is
 test-only and is never exposed outside loopback.
 
 ## Rollback
 
-1. The HTTPS path has no production URL and is not wired into the release UI, so
-   build 28 remains the active behavior.
+1. Disable the build-29 HTTPS pairing and reinstall build 28.
 2. Continue through the iPhone/Bridge route.
 3. If a binary rollback is needed, install the archived artifacts from
    `~/Library/Application Support/CodexWatch/RestorePoints/0.6-build-28-5fd8d18/`

@@ -65,6 +65,28 @@ private struct BridgeConfigurationView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+            GroupBox("Conexión HTTPS directa del Watch") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Label(
+                        controller.cloudRelayStatus,
+                        systemImage: controller.isCloudRelayPaired
+                            ? "applewatch.radiowaves.left.and.right"
+                            : "icloud.slash"
+                    )
+                    .foregroundStyle(controller.isCloudRelayPaired ? .green : .secondary)
+                    if let code = controller.pendingCloudPairingCode {
+                        Text("Comprueba que el Watch muestra este código:")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Text(code)
+                            .font(.system(.title, design: .monospaced).bold())
+                            .textSelection(.enabled)
+                    }
+                    Text("El buzón es cifrado de extremo a extremo y el Mac solo realiza conexiones HTTPS salientes.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
             GroupBox("Transcripción de notas de voz") {
                 VStack(alignment: .leading, spacing: 10) {
                     Label(
@@ -109,17 +131,25 @@ final class BridgeController: ObservableObject {
     @Published private(set) var tasks: [CodexTask] = []
     @Published private(set) var accessToken = ""
     @Published private(set) var hasOpenAIAPIKey = false
+    @Published private(set) var cloudRelayStatus = "No configurado"
+    @Published private(set) var pendingCloudPairingCode: String?
+    @Published private(set) var isCloudRelayPaired = false
 
     private let appServer = CodexAppServerClient()
     private let openAITranscriber = OpenAITranscriptionClient()
     private var httpServer: LocalHTTPServer?
     private var retryTask: Task<Void, Never>?
     private var connectionMonitorTask: Task<Void, Never>?
+    private var cloudConsumerTask: Task<Void, Never>?
     private var isHTTPReady = false
     private var isCodexReady = false
     private var refreshInProgress = false
     private var creationInProgress = false
     private var lastSuccessfulCompanionContact: Date?
+    private var lastSuccessfulCloudWatchContact: Date?
+    private var cloudProvisioning: BridgeCloudRelayProvisioning?
+    private var pendingCloudPairing: CloudRelayPairingOffer?
+    private var cloudTransportConfigured = false
     private var authenticationLimiter = AuthenticationRateLimiter()
     private var commandReceipts: [UUID: CommandReceipt] = [:]
     private var operationSafety = BridgeOperationSafety()
@@ -156,6 +186,7 @@ final class BridgeController: ObservableObject {
                 Self.logger.warning("La clave opcional de transcripción requiere acceso interactivo al llavero")
             }
             Self.audit("codexwatch_secure_state_ready")
+            configureCloudRelay()
         } catch {
             status = "No se pudo acceder al llavero: \(error.localizedDescription)"
             Self.logger.error("No se pudo cargar el estado seguro del Bridge: \(error.localizedDescription, privacy: .public)")
@@ -258,18 +289,28 @@ final class BridgeController: ObservableObject {
     }
 
     private func updateReadiness(preserveStatus: Bool = false) {
+        let latestWatchContact = [lastSuccessfulCompanionContact, lastSuccessfulCloudWatchContact]
+            .compactMap { $0 }
+            .max()
         connectionState = .resolve(
-            localServicesReady: isHTTPReady && isCodexReady,
-            lastSuccessfulCompanionContact: lastSuccessfulCompanionContact,
+            localServicesReady: isCodexReady && (isHTTPReady || cloudTransportConfigured),
+            lastSuccessfulCompanionContact: latestWatchContact,
             now: Date(),
             contactTimeout: Self.companionContactTimeout
         )
         if preserveStatus { return }
         switch connectionState {
         case .connected:
-            status = "iPhone conectado · Codex y puente disponibles"
+            if let cloud = lastSuccessfulCloudWatchContact,
+               Date().timeIntervalSince(cloud) <= Self.companionContactTimeout {
+                status = "Watch conectado directamente por HTTPS · Codex disponible"
+            } else {
+                status = "iPhone conectado · Codex y puente disponibles"
+            }
         case .waitingForCompanion:
-            status = "Codex y puente disponibles · esperando al iPhone"
+            status = cloudTransportConfigured
+                ? "Codex y HTTPS disponibles · esperando al Watch"
+                : "Codex y puente disponibles · esperando al iPhone"
         case .unavailable where !isHTTPReady && isCodexReady:
             status = "Codex disponible · iniciando el puente…"
         case .unavailable:
@@ -306,6 +347,32 @@ final class BridgeController: ObservableObject {
 
     private func handleAuthenticated(_ request: HTTPRequest) async -> HTTPResponse {
         if request.path == "/health" { return .json(["status": "ok"]) }
+
+        if request.method == "POST", request.path == "/cloud-relay/pair" {
+            guard let value = try? CodexWatchWire.decode(
+                CloudRelayPairingRequest.self,
+                from: request.body
+            ) else { return .badRequest }
+            do {
+                return .encodable(try beginCloudPairing(value))
+            } catch {
+                Self.logger.error("No se pudo iniciar el pairing HTTPS: \(error.localizedDescription, privacy: .public)")
+                return .serverError()
+            }
+        }
+
+        if request.method == "POST", request.path == "/cloud-relay/approve" {
+            guard let value = try? CodexWatchWire.decode(
+                CloudRelayPairingApproval.self,
+                from: request.body
+            ) else { return .badRequest }
+            do {
+                return .encodable(try approveCloudPairing(value))
+            } catch {
+                Self.logger.error("No se pudo aprobar el pairing HTTPS: \(error.localizedDescription, privacy: .public)")
+                return .serverError()
+            }
+        }
 
         if request.method == "GET", request.path.hasPrefix("/commands/") {
             let rawID = String(request.path.dropFirst("/commands/".count))
@@ -639,6 +706,216 @@ final class BridgeController: ObservableObject {
         commandReceipts[receipt.commandID] = receipt
         if commandReceipts.count > 100 {
             commandReceipts.removeValue(forKey: commandReceipts.keys.first!)
+        }
+    }
+
+    private func configureCloudRelay() {
+        do {
+            let provisioning = try BridgeCloudRelayProvisioning.load()
+            cloudProvisioning = provisioning
+            cloudRelayStatus = "Buzón desplegado · esperando emparejamiento"
+            if CloudRelayKeyStore.loadActivePairingID(role: "mac") == provisioning.pairingID,
+               let pairing = try CloudRelayKeyStore.loadPairing(
+                   role: "mac",
+                   pairingID: provisioning.pairingID
+               ), pairing.isApproved {
+                isCloudRelayPaired = true
+                startCloudConsumer(pairing: pairing, provisioning: provisioning)
+            }
+        } catch {
+            cloudRelayStatus = "Buzón HTTPS no aprovisionado"
+            Self.logger.info("El transporte HTTPS todavía no está disponible: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func beginCloudPairing(
+        _ request: CloudRelayPairingRequest
+    ) throws -> CloudRelayPairingOffer {
+        guard request.watchPublicKey.count == 32,
+              !request.watchDeviceID.isEmpty,
+              let provisioning = cloudProvisioning else {
+            throw NSError(
+                domain: "CodexWatch.CloudRelay",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "El buzón HTTPS no está preparado"]
+            )
+        }
+        let identity = try CloudRelayKeyStore.loadOrCreateIdentity(role: "mac")
+        let publicKey = try CloudRelayProtocol.publicKey(for: identity.privateKey)
+        let code = CloudRelayProtocol.shortAuthenticationString(
+            pairingID: provisioning.pairingID,
+            firstPublicKey: request.watchPublicKey,
+            secondPublicKey: publicKey
+        )
+        let offer = CloudRelayPairingOffer(
+            configuration: provisioning.transportConfiguration,
+            macDeviceID: identity.deviceID,
+            macPublicKey: publicKey,
+            watchDeviceID: request.watchDeviceID,
+            watchPublicKey: request.watchPublicKey,
+            authenticationCode: code
+        )
+        pendingCloudPairing = offer
+        try CloudRelayKeyStore.savePendingOffer(offer, role: "mac")
+        pendingCloudPairingCode = code
+        cloudRelayStatus = "Comprobación pendiente en el Watch"
+        return offer
+    }
+
+    private func approveCloudPairing(
+        _ approval: CloudRelayPairingApproval
+    ) throws -> CloudRelayPairingResult {
+        let recoveredOffer = try CloudRelayKeyStore.loadPendingOffer(role: "mac")
+        guard let offer = pendingCloudPairing ?? recoveredOffer,
+              offer.configuration.pairingID == approval.pairingID,
+              offer.watchDeviceID == approval.watchDeviceID,
+              offer.watchPublicKey == approval.watchPublicKey,
+              offer.authenticationCode == approval.authenticationCode,
+              let provisioning = cloudProvisioning else {
+            throw NSError(
+                domain: "CodexWatch.CloudRelay",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "La comprobación de claves no coincide"]
+            )
+        }
+        let identity = try CloudRelayKeyStore.loadOrCreateIdentity(role: "mac")
+        let pairing = CloudRelayProtocol.PairingMaterial(
+            pairingID: approval.pairingID,
+            deviceID: identity.deviceID,
+            privateKey: identity.privateKey,
+            peerPublicKey: approval.watchPublicKey,
+            approvedAt: Date()
+        )
+        try CloudRelayKeyStore.savePairing(pairing, role: "mac")
+        try CloudRelayKeyStore.saveTransport(
+            provisioning.transportConfiguration,
+            role: "mac"
+        )
+        CloudRelayKeyStore.setActivePairingID(approval.pairingID, role: "mac")
+        pendingCloudPairing = nil
+        try? CloudRelayKeyStore.deletePendingOffer(role: "mac")
+        pendingCloudPairingCode = nil
+        isCloudRelayPaired = true
+        startCloudConsumer(pairing: pairing, provisioning: provisioning)
+        return CloudRelayPairingResult(
+            pairingID: approval.pairingID,
+            accepted: true,
+            message: "Conexión HTTPS directa activada"
+        )
+    }
+
+    private func startCloudConsumer(
+        pairing: CloudRelayProtocol.PairingMaterial,
+        provisioning: BridgeCloudRelayProvisioning
+    ) {
+        cloudConsumerTask?.cancel()
+        do {
+            let transport = BlindMailboxHTTPClient(configuration: try .init(
+                baseURL: provisioning.baseURL,
+                pairingID: provisioning.pairingID,
+                transportSecret: provisioning.transportSecret
+            ))
+            let outbox = try CloudRelayOutbox()
+            let consumer = try BridgeCloudMailboxConsumer(
+                transport: transport,
+                outbox: outbox,
+                pairingID: provisioning.pairingID,
+                localPrivateKey: pairing.privateKey,
+                peerPublicKey: pairing.peerPublicKey!,
+                deliver: { [weak self] command in
+                    guard let self else { return .retryableFailure }
+                    return await self.deliverCloudCommand(command)
+                },
+                operationStatus: { [weak self] commandID in
+                    guard let self else { throw CancellationError() }
+                    return try await self.appServer.operationStatus(for: commandID)
+                },
+                heartbeat: { [weak self] _ in
+                    await self?.recordCloudHeartbeat()
+                }
+            )
+            cloudTransportConfigured = true
+            cloudRelayStatus = "Emparejado · esperando al Watch"
+            cloudConsumerTask = Task { [weak self] in
+                var delay: UInt64 = 2
+                while !Task.isCancelled {
+                    do {
+                        try await consumer.reconcileOutbox()
+                        _ = try await consumer.drainOnce(waitSeconds: 20)
+                        delay = 2
+                    } catch is CancellationError {
+                        return
+                    } catch {
+                        self?.cloudRelayStatus = "HTTPS temporalmente no disponible"
+                        try? await Task.sleep(for: .seconds(delay))
+                        delay = min(delay * 2, 30)
+                    }
+                }
+            }
+            updateReadiness()
+        } catch {
+            cloudTransportConfigured = false
+            cloudRelayStatus = "No se pudo iniciar HTTPS: \(error.localizedDescription)"
+        }
+    }
+
+    private func recordCloudHeartbeat() {
+        lastSuccessfulCloudWatchContact = Date()
+        cloudRelayStatus = "Watch conectado directamente"
+        updateReadiness()
+    }
+
+    private func deliverCloudCommand(
+        _ command: CodexCommand
+    ) async -> BridgeCloudMailboxConsumer.DeliveryOutcome {
+        let correlationID = "mailbox-\(command.id.uuidString.lowercased())"
+        switch operationSafety.beginWrite(commandID: command.id, threadID: command.taskID) {
+        case .duplicate(let receipt):
+            switch receipt.state {
+            case .sent: return .completed(receipt.message)
+            case .queued: return .queued(receipt.message)
+            case .failed: return .rejected(receipt.message)
+            }
+        case .threadBusy, .circuitOpen:
+            return .retryableFailure
+        case .started:
+            telemetry(
+                correlationID,
+                threadID: command.taskID,
+                operation: "write",
+                origin: "watch-https",
+                result: "start"
+            )
+        }
+        do {
+            let disposition = try await appServer.send(command)
+            let receipt: CommandReceipt
+            let outcome: BridgeCloudMailboxConsumer.DeliveryOutcome
+            switch disposition {
+            case .completed:
+                receipt = .init(commandID: command.id, state: .sent, message: "Orden enviada")
+                outcome = .completed(receipt.message)
+            case .queued:
+                receipt = .init(
+                    commandID: command.id,
+                    state: .queued,
+                    message: "Orden aceptada; esperando disponibilidad de la tarea"
+                )
+                outcome = .queued(receipt.message)
+            }
+            operationSafety.finishWrite(threadID: command.taskID, receipt: receipt)
+            remember(receipt)
+            return outcome
+        } catch {
+            let text = error.localizedDescription
+            let retryable = error is CancellationError
+                || (error as? URLError)?.code == .timedOut
+                || text.contains("HTTP 503")
+                || text.localizedCaseInsensitiveContains("no disponible")
+            let receipt = CommandReceipt(commandID: command.id, state: .failed, message: text)
+            operationSafety.finishWrite(threadID: command.taskID, receipt: receipt)
+            remember(receipt)
+            return retryable ? .retryableFailure : .rejected(text)
         }
     }
 

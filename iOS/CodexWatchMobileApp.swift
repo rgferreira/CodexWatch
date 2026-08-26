@@ -647,6 +647,52 @@ extension PhoneRelay: WCSessionDelegate {
         replyHandler: @escaping ([String: Any]) -> Void
     ) {
         let reply = WatchReplyHandlerBox(replyHandler)
+        if let requestData = message[CodexWatchWire.cloudPairingRequest] as? Data {
+            Task { @MainActor [weak self] in
+                guard let self,
+                      let request = try? CodexWatchWire.decode(
+                        CloudRelayPairingRequest.self,
+                        from: requestData
+                      ),
+                      let baseURL = activeBridgeURL ?? configuredBridgeURL else {
+                    reply.call([:])
+                    return
+                }
+                do {
+                    let offer = try await MacBridgeClient(baseURL: baseURL, token: accessToken)
+                        .beginCloudPairing(request)
+                    reply.call([
+                        CodexWatchWire.cloudPairingOffer: try CodexWatchWire.encode(offer)
+                    ])
+                } catch {
+                    reply.call([:])
+                }
+            }
+            return
+        }
+        if let approvalData = message[CodexWatchWire.cloudPairingApproval] as? Data {
+            Task { @MainActor [weak self] in
+                guard let self,
+                      let approval = try? CodexWatchWire.decode(
+                        CloudRelayPairingApproval.self,
+                        from: approvalData
+                      ),
+                      let baseURL = activeBridgeURL ?? configuredBridgeURL else {
+                    reply.call([:])
+                    return
+                }
+                do {
+                    let result = try await MacBridgeClient(baseURL: baseURL, token: accessToken)
+                        .approveCloudPairing(approval)
+                    reply.call([
+                        CodexWatchWire.cloudPairingResult: try CodexWatchWire.encode(result)
+                    ])
+                } catch {
+                    reply.call([:])
+                }
+            }
+            return
+        }
         if let commandData = message[CodexWatchWire.newTaskCommand] as? Data {
             receiveNewTask(commandData, reply: reply)
             return
@@ -716,6 +762,42 @@ extension PhoneRelay: WCSessionDelegate {
     }
 
     nonisolated func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
+        if let requestData = userInfo[CodexWatchWire.cloudPairingRequest] as? Data {
+            Task { @MainActor [weak self] in
+                guard let self,
+                      let request = try? CodexWatchWire.decode(
+                        CloudRelayPairingRequest.self,
+                        from: requestData
+                      ),
+                      let baseURL = activeBridgeURL ?? configuredBridgeURL else { return }
+                do {
+                    let offer = try await MacBridgeClient(baseURL: baseURL, token: accessToken)
+                        .beginCloudPairing(request)
+                    sendCloudPairingValue(offer, key: CodexWatchWire.cloudPairingOffer)
+                } catch {
+                    statusMessage = "No se pudo preparar la conexión directa"
+                }
+            }
+            return
+        }
+        if let approvalData = userInfo[CodexWatchWire.cloudPairingApproval] as? Data {
+            Task { @MainActor [weak self] in
+                guard let self,
+                      let approval = try? CodexWatchWire.decode(
+                        CloudRelayPairingApproval.self,
+                        from: approvalData
+                      ),
+                      let baseURL = activeBridgeURL ?? configuredBridgeURL else { return }
+                do {
+                    let result = try await MacBridgeClient(baseURL: baseURL, token: accessToken)
+                        .approveCloudPairing(approval)
+                    sendCloudPairingValue(result, key: CodexWatchWire.cloudPairingResult)
+                } catch {
+                    statusMessage = "No se pudo confirmar la conexión directa"
+                }
+            }
+            return
+        }
         if let data = userInfo[CodexWatchWire.newTaskCommand] as? Data {
             receiveNewTask(data)
             return
@@ -739,6 +821,14 @@ extension PhoneRelay: WCSessionDelegate {
                 await refreshTasks()
             }
         }
+    }
+
+    private func sendCloudPairingValue<T: Encodable>(_ value: T, key: String) {
+        guard let session, let data = try? CodexWatchWire.encode(value) else { return }
+        if session.isReachable {
+            session.sendMessage([key: data], replyHandler: nil)
+        }
+        session.transferUserInfo([key: data])
     }
 
     nonisolated func session(_ session: WCSession, didReceive file: WCSessionFile) {
@@ -867,6 +957,30 @@ private struct MacBridgeClient: Sendable {
         let (data, response) = try await URLSession.shared.data(for: request)
         try validate(response, data: data)
         return try CodexWatchWire.decode([CodexTask].self, from: data)
+    }
+
+    func beginCloudPairing(
+        _ value: CloudRelayPairingRequest
+    ) async throws -> CloudRelayPairingOffer {
+        var request = try request(path: "/cloud-relay/pair")
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try CodexWatchWire.encode(value)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validate(response, data: data)
+        return try CodexWatchWire.decode(CloudRelayPairingOffer.self, from: data)
+    }
+
+    func approveCloudPairing(
+        _ value: CloudRelayPairingApproval
+    ) async throws -> CloudRelayPairingResult {
+        var request = try request(path: "/cloud-relay/approve")
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try CodexWatchWire.encode(value)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validate(response, data: data)
+        return try CodexWatchWire.decode(CloudRelayPairingResult.self, from: data)
     }
 
     func submit(_ command: CodexCommand) async throws -> CommandReceipt {

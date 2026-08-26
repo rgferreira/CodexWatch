@@ -13,6 +13,7 @@ actor BridgeCloudMailboxConsumer {
 
     typealias Deliver = @Sendable (CodexCommand) async -> DeliveryOutcome
     typealias OperationStatus = @Sendable (UUID) async throws -> String
+    typealias Heartbeat = @Sendable (Date) async -> Void
 
     private static let logger = Logger(
         subsystem: "com.rgferreira.CodexWatchBridge",
@@ -24,6 +25,7 @@ actor BridgeCloudMailboxConsumer {
     private let key: SymmetricKey
     private let deliver: Deliver
     private let operationStatus: OperationStatus
+    private let heartbeat: Heartbeat
 
     init(
         transport: any BlindMailboxTransport,
@@ -32,7 +34,8 @@ actor BridgeCloudMailboxConsumer {
         localPrivateKey: Data,
         peerPublicKey: Data,
         deliver: @escaping Deliver,
-        operationStatus: @escaping OperationStatus
+        operationStatus: @escaping OperationStatus,
+        heartbeat: @escaping Heartbeat = { _ in }
     ) throws {
         self.transport = transport
         self.outbox = outbox
@@ -44,6 +47,7 @@ actor BridgeCloudMailboxConsumer {
         )
         self.deliver = deliver
         self.operationStatus = operationStatus
+        self.heartbeat = heartbeat
     }
 
     /// Drains only one item so the caller can apply bounded backoff and a circuit
@@ -62,6 +66,15 @@ actor BridgeCloudMailboxConsumer {
             expectedDirection: .watchToMac,
             key: key
         )
+        if payload.operation == .heartbeat {
+            let value = try payload.decode(CloudRelayProtocol.Heartbeat.self)
+            await heartbeat(value.sentAt)
+            try await transport.acknowledge(
+                recordID: claim.recordID,
+                leaseToken: claim.leaseToken
+            )
+            return true
+        }
         guard payload.operation == .textCommand else {
             throw CloudRelayProtocol.ProtocolError.operationMismatch
         }

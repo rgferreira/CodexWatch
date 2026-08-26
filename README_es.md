@@ -42,14 +42,13 @@ Configura en la app del iPhone el método de conexión, la IP o nombre del Mac, 
 
 Para usarlo fuera de casa, la configuración activa del bridge usa la IP privada de ZeroTier detectada en el Mac. El cliente admite configurar otros destinos privados, pero requieren que el servicio correspondiente se vincule explícitamente a esa interfaz; no se abre automáticamente en Wi-Fi/LAN. Un dominio o una IP pública exige HTTPS y un proxy seguro. El puerto HTTP `48720` del bridge no debe publicarse directamente en Internet.
 
-### Transporte independiente del Watch (en desarrollo)
+### Transporte independiente del Watch (piloto)
 
-Se está preparando una ruta sin iPhone mediante un buzón HTTPS ciego, cifrado de
-extremo a extremo y con conexiones únicamente salientes desde el Watch y el Mac.
-Conserva el mismo UUID de orden y termina igualmente en el Controller loopback de
-Relay. Todavía no existe un buzón público provisionado, por lo que esta ruta no
-está activa en la app de producción y el iPhone sigue siendo el fallback. El
-protocolo, la frontera de seguridad, las pruebas contra mock y el rollback están
+La build 0.7/29 incorpora una ruta sin iPhone para órdenes de texto mediante un
+buzón HTTPS ciego, cifrado de extremo a extremo y con conexiones únicamente
+salientes desde el Watch y el Mac. Conserva el mismo UUID de orden y termina en
+el Controller loopback de Relay; la ruta del iPhone permanece como respaldo. El
+protocolo, la frontera de seguridad, la validación real y el rollback están
 documentados en [Transporte independiente del Watch](docs/HTTPS-MAILBOX-TRANSPORT.md).
 
 ## Controles de seguridad

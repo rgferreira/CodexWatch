@@ -59,4 +59,47 @@ enum CloudRelayKeyStore {
     static func setActivePairingID(_ pairingID: String?, role: String) {
         UserDefaults.standard.set(pairingID, forKey: "cloudRelay.\(role).activePairingID")
     }
+
+    static func loadTransport(role: String, pairingID: String) throws
+        -> CloudRelayTransportConfiguration? {
+        guard let data = try SecureTokenStore.loadData(
+            service: service,
+            account: "\(role)-transport-\(pairingID)"
+        ) else { return nil }
+        return try CodexWatchWire.decode(CloudRelayTransportConfiguration.self, from: data)
+    }
+
+    static func saveTransport(
+        _ configuration: CloudRelayTransportConfiguration,
+        role: String
+    ) throws {
+        try SecureTokenStore.saveData(
+            CodexWatchWire.encode(configuration),
+            service: service,
+            account: "\(role)-transport-\(configuration.pairingID)"
+        )
+    }
+
+    static func loadPendingOffer(role: String) throws -> CloudRelayPairingOffer? {
+        guard let data = try SecureTokenStore.loadData(
+            service: service,
+            account: "\(role)-pending-offer"
+        ) else { return nil }
+        return try CodexWatchWire.decode(CloudRelayPairingOffer.self, from: data)
+    }
+
+    static func savePendingOffer(_ offer: CloudRelayPairingOffer, role: String) throws {
+        try SecureTokenStore.saveData(
+            CodexWatchWire.encode(offer),
+            service: service,
+            account: "\(role)-pending-offer"
+        )
+    }
+
+    static func deletePendingOffer(role: String) throws {
+        try SecureTokenStore.delete(
+            service: service,
+            account: "\(role)-pending-offer"
+        )
+    }
 }

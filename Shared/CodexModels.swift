@@ -304,6 +304,10 @@ enum CodexWatchWire {
     static let conversationRequest = "codexwatch.conversation.request"
     static let conversationResponse = "codexwatch.conversation.response"
     static let conversationError = "codexwatch.conversation.error"
+    static let cloudPairingRequest = "codexwatch.cloud.pairing.request"
+    static let cloudPairingOffer = "codexwatch.cloud.pairing.offer"
+    static let cloudPairingApproval = "codexwatch.cloud.pairing.approval"
+    static let cloudPairingResult = "codexwatch.cloud.pairing.result"
 
     static func encode<T: Encodable>(_ value: T) throws -> Data {
         let encoder = JSONEncoder()

@@ -274,6 +274,18 @@ struct TaskPickerView: View {
       }
     }
     .task { await relay.refreshTasksContinuously() }
+    .alert(
+      "Activar conexión directa",
+      isPresented: Binding(
+        get: { relay.pendingCloudPairingCode != nil },
+        set: { _ in }
+      )
+    ) {
+      Button("Coincide · Activar") { relay.approveCloudPairing() }
+      Button("Cancelar", role: .cancel) { relay.cancelCloudPairing() }
+    } message: {
+      Text("Comprueba en el Mac el código \(relay.pendingCloudPairingCode ?? "").")
+    }
   }
 }
 
@@ -822,12 +834,18 @@ final class WatchRelay: NSObject, ObservableObject {
   @Published private(set) var commandReceipts: [UUID: CommandReceipt] = [:]
   @Published private(set) var voiceInputMode: VoiceInputMode = .watchDictation
   @Published private(set) var transcriptionModel: OpenAITranscriptionModel = .gptTranscribe
+  @Published private(set) var pendingCloudPairingCode: String?
+  @Published private(set) var cloudTransportStatus = "Sin conexión directa"
 
   private let session: WCSession? = WCSession.isSupported() ? .default : nil
   let isDemoMode = ProcessInfo.processInfo.arguments.contains("--codexwatch-demo")
   private var lastQueuedTaskRequest: Date?
   private var latestTasksRevision = UserDefaults.standard.double(forKey: "latestTasksRevision")
   private var conversationRevisions: [String: Date] = [:]
+  private var pendingCloudPairingOffer: CloudRelayPairingOffer?
+  private var cloudClient: WatchCloudRelayClient?
+  private var cloudReceiveTask: Task<Void, Never>?
+  private var pairingRequestInFlight = false
   private static let cachedConversationsKey = "cachedConversations"
 
   private override init() {
@@ -848,6 +866,7 @@ final class WatchRelay: NSObject, ObservableObject {
     guard session?.delegate == nil else { return }
     session?.delegate = self
     session?.activate()
+    configureExistingCloudTransport()
     if let data = session?.receivedApplicationContext[CodexWatchWire.tasks] as? Data {
       applyTasks(
         data,
@@ -884,19 +903,47 @@ final class WatchRelay: NSObject, ObservableObject {
       }
       return command.id
     }
-    guard let data = try? CodexWatchWire.encode(command),
-          let session,
-          session.activationState == .activated else {
+    guard let data = try? CodexWatchWire.encode(command) else {
       commandReceipts[command.id] = CommandReceipt(
         commandID: command.id,
         state: .failed,
-        message: "El Watch no está conectado con el iPhone"
+        message: "No se pudo preparar la orden"
       )
       return command.id
     }
+    if let cloudClient {
+      Task { [weak self] in
+        do {
+          try await cloudClient.send(command)
+          guard let self else { return }
+          commandReceipts[command.id] = CommandReceipt(
+            commandID: command.id,
+            state: .queued,
+            message: "Enviada directamente por HTTPS…"
+          )
+          cloudTransportStatus = "Conexión directa activa"
+        } catch {
+          self?.sendThroughCompanion(commandID: command.id, data: data)
+        }
+      }
+      return command.id
+    }
+    sendThroughCompanion(commandID: command.id, data: data)
+    return command.id
+  }
+
+  private func sendThroughCompanion(commandID: UUID, data: Data) {
+    guard let session, session.activationState == .activated else {
+      commandReceipts[commandID] = CommandReceipt(
+        commandID: commandID,
+        state: .failed,
+        message: "El Watch no está conectado con el iPhone"
+      )
+      return
+    }
     if session.isReachable {
       let replyHandler = WatchCommandReplyHandler(
-        commandID: command.id,
+        commandID: commandID,
         commandData: data,
         session: session
       )
@@ -907,13 +954,12 @@ final class WatchRelay: NSObject, ObservableObject {
       )
     } else {
       session.transferUserInfo([CodexWatchWire.command: data])
-      commandReceipts[command.id] = CommandReceipt(
-        commandID: command.id,
+      commandReceipts[commandID] = CommandReceipt(
+        commandID: commandID,
         state: .queued,
         message: "Pendiente de que responda el iPhone…"
       )
     }
-    return command.id
   }
 
   func createTask(_ command: NewTaskCommand) -> UUID {
@@ -1169,6 +1215,178 @@ final class WatchRelay: NSObject, ObservableObject {
     }
   }
 
+  func cancelCloudPairing() {
+    pendingCloudPairingOffer = nil
+    pendingCloudPairingCode = nil
+    pairingRequestInFlight = false
+    try? CloudRelayKeyStore.deletePendingOffer(role: "watch")
+  }
+
+  func approveCloudPairing() {
+    guard let offer = pendingCloudPairingOffer ?? (try? CloudRelayKeyStore.loadPendingOffer(role: "watch")),
+          let session,
+          session.activationState == .activated else {
+      cloudTransportStatus = "Abre el Companion para terminar el pairing"
+      return
+    }
+    let approval = CloudRelayPairingApproval(
+      pairingID: offer.configuration.pairingID,
+      watchDeviceID: offer.watchDeviceID,
+      watchPublicKey: offer.watchPublicKey,
+      authenticationCode: offer.authenticationCode
+    )
+    guard let data = try? CodexWatchWire.encode(approval) else { return }
+    cloudTransportStatus = "Confirmando con el Mac…"
+    if session.isReachable {
+      let handler = WatchCloudPairingApprovalReplyHandler(offer: offer)
+      session.sendMessage(
+        [CodexWatchWire.cloudPairingApproval: data],
+        replyHandler: handler.receive,
+        errorHandler: handler.fail
+      )
+    } else {
+      session.transferUserInfo([CodexWatchWire.cloudPairingApproval: data])
+      cloudTransportStatus = "Confirmación pendiente del iPhone…"
+    }
+  }
+
+  fileprivate func requestCloudPairingIfNeeded() {
+    guard cloudClient == nil,
+          pendingCloudPairingOffer == nil,
+          !pairingRequestInFlight,
+          let session,
+          session.activationState == .activated else { return }
+    do {
+      let identity = try CloudRelayKeyStore.loadOrCreateIdentity(role: "watch")
+      let request = CloudRelayPairingRequest(
+        watchDeviceID: identity.deviceID,
+        watchPublicKey: try CloudRelayProtocol.publicKey(for: identity.privateKey)
+      )
+      pairingRequestInFlight = true
+      let data = try CodexWatchWire.encode(request)
+      if session.isReachable {
+        let handler = WatchCloudPairingOfferReplyHandler()
+        session.sendMessage(
+          [CodexWatchWire.cloudPairingRequest: data],
+          replyHandler: handler.receive,
+          errorHandler: handler.fail
+        )
+      } else {
+        session.transferUserInfo([CodexWatchWire.cloudPairingRequest: data])
+        cloudTransportStatus = "Pairing pendiente del iPhone…"
+      }
+    } catch {
+      cloudTransportStatus = "No se pudo preparar el pairing"
+    }
+  }
+
+  fileprivate func receiveCloudPairingOffer(_ data: Data) {
+    pairingRequestInFlight = false
+    do {
+      let offer = try CodexWatchWire.decode(CloudRelayPairingOffer.self, from: data)
+      let identity = try CloudRelayKeyStore.loadOrCreateIdentity(role: "watch")
+      let publicKey = try CloudRelayProtocol.publicKey(for: identity.privateKey)
+      guard offer.watchDeviceID == identity.deviceID,
+            offer.watchPublicKey == publicKey,
+            offer.authenticationCode == CloudRelayProtocol.shortAuthenticationString(
+              pairingID: offer.configuration.pairingID,
+              firstPublicKey: publicKey,
+              secondPublicKey: offer.macPublicKey
+            ) else {
+        throw CloudRelayProtocol.ProtocolError.authenticationFailed
+      }
+      pendingCloudPairingOffer = offer
+      try CloudRelayKeyStore.savePendingOffer(offer, role: "watch")
+      pendingCloudPairingCode = offer.authenticationCode
+      cloudTransportStatus = "Confirma el código con el Mac"
+    } catch {
+      cloudTransportStatus = "La oferta de pairing no es válida"
+    }
+  }
+
+  fileprivate func finishCloudPairing(
+    resultData: Data,
+    offer: CloudRelayPairingOffer
+  ) {
+    do {
+      let result = try CodexWatchWire.decode(CloudRelayPairingResult.self, from: resultData)
+      guard result.accepted, result.pairingID == offer.configuration.pairingID else {
+        throw CloudRelayProtocol.ProtocolError.authenticationFailed
+      }
+      let identity = try CloudRelayKeyStore.loadOrCreateIdentity(role: "watch")
+      let pairing = CloudRelayProtocol.PairingMaterial(
+        pairingID: result.pairingID,
+        deviceID: identity.deviceID,
+        privateKey: identity.privateKey,
+        peerPublicKey: offer.macPublicKey,
+        approvedAt: Date()
+      )
+      try CloudRelayKeyStore.savePairing(pairing, role: "watch")
+      try CloudRelayKeyStore.saveTransport(offer.configuration, role: "watch")
+      CloudRelayKeyStore.setActivePairingID(result.pairingID, role: "watch")
+      pendingCloudPairingOffer = nil
+      pendingCloudPairingCode = nil
+      try? CloudRelayKeyStore.deletePendingOffer(role: "watch")
+      configureExistingCloudTransport()
+    } catch {
+      cloudTransportStatus = "No se pudo guardar el pairing"
+    }
+  }
+
+  fileprivate func failCloudPairing(_ message: String) {
+    pairingRequestInFlight = false
+    cloudTransportStatus = message
+  }
+
+  private func configureExistingCloudTransport() {
+    guard cloudClient == nil,
+          let pairingID = CloudRelayKeyStore.loadActivePairingID(role: "watch") else {
+      requestCloudPairingIfNeeded()
+      return
+    }
+    do {
+      guard let pairing = try CloudRelayKeyStore.loadPairing(
+        role: "watch",
+        pairingID: pairingID
+      ), let configuration = try CloudRelayKeyStore.loadTransport(
+        role: "watch",
+        pairingID: pairingID
+      ) else { throw BlindMailboxHTTPClient.ClientError.invalidConfiguration }
+      let client = try WatchCloudRelayClient(
+        configuration: configuration,
+        pairing: pairing
+      )
+      cloudClient = client
+      cloudTransportStatus = "Conexión directa preparada"
+      startCloudReceiveLoop(client)
+    } catch {
+      cloudTransportStatus = "El pairing guardado no es válido"
+    }
+  }
+
+  private func startCloudReceiveLoop(_ client: WatchCloudRelayClient) {
+    cloudReceiveTask?.cancel()
+    cloudReceiveTask = Task { [weak self] in
+      var delay: UInt64 = 2
+      while !Task.isCancelled {
+        do {
+          try await client.sendHeartbeat()
+          let receipts = try await client.receiveOnce(waitSeconds: 20)
+          guard let self else { return }
+          for receipt in receipts { commandReceipts[receipt.commandID] = receipt }
+          cloudTransportStatus = "Conexión directa activa"
+          delay = 2
+        } catch is CancellationError {
+          return
+        } catch {
+          self?.cloudTransportStatus = "HTTPS sin respuesta · reintentando"
+          try? await Task.sleep(for: .seconds(delay))
+          delay = min(delay * 2, 30)
+        }
+      }
+    }
+  }
+
   private func prepareDemo() {
     let now = Date()
     tasks = [
@@ -1247,7 +1465,10 @@ extension WatchRelay: WCSessionDelegate {
     error: Error?
   ) {
     guard activationState == .activated, error == nil else { return }
-    Task { @MainActor [weak self] in self?.refreshTasks() }
+    Task { @MainActor [weak self] in
+      self?.refreshTasks()
+      self?.requestCloudPairingIfNeeded()
+    }
   }
 
   nonisolated func session(
@@ -1279,6 +1500,8 @@ extension WatchRelay: WCSessionDelegate {
     let inputMode = userInfo[CodexWatchWire.voiceInputMode] as? String
     let transcriptionModel = userInfo[CodexWatchWire.transcriptionModel] as? String
     let receiptData = userInfo[CodexWatchWire.commandReceipt] as? Data
+    let pairingOfferData = userInfo[CodexWatchWire.cloudPairingOffer] as? Data
+    let pairingResultData = userInfo[CodexWatchWire.cloudPairingResult] as? Data
     Task { @MainActor [weak self] in
       if let tasksData { self?.applyTasks(tasksData, revision: tasksRevision) }
       self?.applyVoiceSettings(
@@ -1286,12 +1509,21 @@ extension WatchRelay: WCSessionDelegate {
         modelRawValue: transcriptionModel
       )
       if let receiptData { self?.applyCommandReceipt(receiptData) }
+      if let pairingOfferData { self?.receiveCloudPairingOffer(pairingOfferData) }
+      if let pairingResultData,
+         let offer = self?.pendingCloudPairingOffer
+            ?? (try? CloudRelayKeyStore.loadPendingOffer(role: "watch")) {
+        self?.finishCloudPairing(resultData: pairingResultData, offer: offer)
+      }
     }
   }
 
   nonisolated func sessionReachabilityDidChange(_ session: WCSession) {
     guard session.isReachable else { return }
-    Task { @MainActor [weak self] in self?.refreshTasks() }
+    Task { @MainActor [weak self] in
+      self?.refreshTasks()
+      self?.requestCloudPairingIfNeeded()
+    }
   }
 
   nonisolated func session(
@@ -1311,6 +1543,46 @@ extension WatchRelay: WCSessionDelegate {
         state: .failed,
         message: "No se pudo transferir el audio: \(error.localizedDescription)"
       )
+    }
+  }
+}
+
+private final class WatchCloudPairingOfferReplyHandler: @unchecked Sendable {
+  func receive(_ reply: [String: Any]) {
+    guard let data = reply[CodexWatchWire.cloudPairingOffer] as? Data else {
+      fail(URLError(.badServerResponse))
+      return
+    }
+    Task { @MainActor in WatchRelay.shared.receiveCloudPairingOffer(data) }
+  }
+
+  func fail(_ error: Error) {
+    Task { @MainActor in
+      WatchRelay.shared.failCloudPairing("Abre el Companion para activar HTTPS")
+    }
+  }
+}
+
+private final class WatchCloudPairingApprovalReplyHandler: @unchecked Sendable {
+  private let offer: CloudRelayPairingOffer
+
+  init(offer: CloudRelayPairingOffer) {
+    self.offer = offer
+  }
+
+  func receive(_ reply: [String: Any]) {
+    guard let data = reply[CodexWatchWire.cloudPairingResult] as? Data else {
+      fail(URLError(.badServerResponse))
+      return
+    }
+    Task { @MainActor [offer] in
+      WatchRelay.shared.finishCloudPairing(resultData: data, offer: offer)
+    }
+  }
+
+  func fail(_ error: Error) {
+    Task { @MainActor in
+      WatchRelay.shared.failCloudPairing("No se pudo confirmar el pairing")
     }
   }
 }
