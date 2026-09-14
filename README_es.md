@@ -23,7 +23,7 @@ El icono de la barra de menús representa la conexión extremo a extremo: verde 
 
 La lista del Watch pide una copia fresca al abrirse y cada 10 segundos mientras permanece visible. La petición de WatchConnectivity despierta a la app compañera del iPhone, que consulta el bridge y responde directamente al reloj; además, el iPhone actualiza su copia cada 15 segundos mientras la app puede ejecutarse. Cada cambio se envía también como instantánea persistente, versionada y deduplicada: el reloj recibe la lista más nueva aunque el mensaje inmediato falle y descarta entregas antiguas. El iPhone conserva la última lista válida para no borrar el reloj con una caché vacía al reactivarse en segundo plano.
 
-El icono `+` de la esquina superior de la lista permite crear una tarea nueva. El reloj propone el proyecto de la tarea más reciente, permite elegir otro proyecto o ninguno, recoge la petición mediante dictado y envía al Controller de Relay una única operación de dominio idempotente.
+El icono `+` de la esquina superior de la lista permite crear una tarea nueva. El selector replica el catálogo local canónico y los nombres visibles de Codex Desktop, incluidos los proyectos sin tareas recientes, con una sola fila por identidad de proyecto y no por carpeta. El reloj permite elegir un proyecto o ninguno, recoge la petición mediante dictado y envía al Controller de Relay una única operación de dominio idempotente usando el ID estable del proyecto.
 
 ## Órdenes de voz
 

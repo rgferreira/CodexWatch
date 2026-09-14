@@ -5,6 +5,7 @@ actor WatchCloudRelayClient {
     enum Event: Sendable {
         case receipt(CommandReceipt)
         case tasks(CloudTaskListResponse)
+        case projects(CloudProjectListResponse)
         case conversation(CloudConversationResponse)
         case readFailure(CloudReadFailure)
         case heartbeatAck(CloudRelayProtocol.HeartbeatAck)
@@ -57,6 +58,14 @@ actor WatchCloudRelayClient {
             commandID: requestID,
             operation: .taskListRequest,
             body: CloudTaskListRequest(requestedAt: Date())
+        )
+    }
+
+    func requestProjects(requestID: UUID) async throws {
+        try await put(
+            commandID: requestID,
+            operation: .projectListRequest,
+            body: CloudProjectListRequest(requestedAt: Date())
         )
     }
 
@@ -145,6 +154,12 @@ actor WatchCloudRelayClient {
                     throw CloudRelayProtocol.ProtocolError.recordBindingMismatch
                 }
                 event = .tasks(response)
+            case .projectListResponse:
+                let response = try payload.decode(CloudProjectListResponse.self)
+                guard response.requestID == payload.commandID else {
+                    throw CloudRelayProtocol.ProtocolError.recordBindingMismatch
+                }
+                event = .projects(response)
             case .conversationResponse:
                 let response = try payload.decode(CloudConversationResponse.self)
                 guard response.requestID == payload.commandID else {

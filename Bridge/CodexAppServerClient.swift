@@ -54,6 +54,26 @@ final class CodexAppServerClient: @unchecked Sendable {
         return tasks
     }
 
+    func listProjects() async throws -> [CodexProject] {
+        let object = try await request(path: "/v1/projects", method: "GET")
+        guard let rows = object["projects"] as? [[String: Any]] else { return [] }
+        var seen = Set<String>()
+        return rows.compactMap { row -> CodexProject? in
+            guard let id = row["id"] as? String, !id.isEmpty, seen.insert(id).inserted,
+                  let rawName = row["name"] as? String else { return nil }
+            let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty else { return nil }
+            guard let rawPath = row["path"] as? String else { return nil }
+            let path = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !path.isEmpty else { return nil }
+            return CodexProject(
+                id: id,
+                name: name,
+                path: path
+            )
+        }
+    }
+
     func send(_ command: CodexCommand) async throws -> SubmissionDisposition {
         let text = command.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, text.count <= 12_000 else {
@@ -91,18 +111,24 @@ final class CodexAppServerClient: @unchecked Sendable {
             throw makeError("La petición debe tener entre 1 y 12.000 caracteres")
         }
         let projectPath = command.projectPath?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let projectID = command.projectID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        var payload: [String: Any] = [
+            "operation_id": "codex-watch:new:\(command.id.uuidString)",
+            "thread_name": "CodexWatch · \(ISO8601DateFormatter().string(from: command.createdAt))",
+            "prompt": prompt,
+            "timeout_seconds": 30 * 60
+        ]
+        if let projectID, !projectID.isEmpty {
+            payload["project_id"] = projectID
+        } else {
+            payload["project_path"] = projectPath?.isEmpty == false
+                ? projectPath!
+                : FileManager.default.homeDirectoryForCurrentUser.path
+        }
         let result = try await request(
             path: "/v1/threads/create-and-submit",
             method: "POST",
-            payload: [
-                "operation_id": "codex-watch:new:\(command.id.uuidString)",
-                "project_path": projectPath?.isEmpty == false
-                    ? projectPath!
-                    : FileManager.default.homeDirectoryForCurrentUser.path,
-                "thread_name": "CodexWatch · \(ISO8601DateFormatter().string(from: command.createdAt))",
-                "prompt": prompt,
-                "timeout_seconds": 30 * 60
-            ],
+            payload: payload,
             timeout: 30 * 60 + 30
         )
         guard result["status"] as? String == "completed",

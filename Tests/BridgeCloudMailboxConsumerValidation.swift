@@ -82,6 +82,16 @@ struct BridgeCloudMailboxConsumerValidation {
             id: "disposable-thread", title: "Consumer validation", preview: "",
             projectPath: nil, updatedAt: Date(), state: .idle
         )
+        let projects = [
+            CodexProject(
+                id: "platform", name: "PLATFORM ENGINEERING",
+                path: "/projects/Relay"
+            ),
+            CodexProject(
+                id: "music", name: "MUSIC SYSTEMS",
+                path: "/projects/ScoreIR"
+            )
+        ]
         let command = CodexCommand(task: task, text: "Queue this once")
         let request = try CloudRelayProtocol.seal(
             payload: try .init(
@@ -110,6 +120,7 @@ struct BridgeCloudMailboxConsumerValidation {
                 return .queued("Accepted by Controller")
             },
             listTasks: { [task] },
+            listProjects: { projects },
             readConversation: { threadID in
                 precondition(threadID == task.id)
                 return [CodexMessage(
@@ -184,6 +195,36 @@ struct BridgeCloudMailboxConsumerValidation {
         precondition(taskResponse.requestID == taskRequestID)
         precondition(taskResponse.tasks.count == 1)
         precondition(taskResponse.tasks[0].id == task.id)
+
+        let projectRequestID = UUID()
+        let projectRequest = try CloudRelayProtocol.seal(
+            payload: try .init(
+                commandID: projectRequestID,
+                operation: .projectListRequest,
+                body: CloudProjectListRequest(requestedAt: Date())
+            ),
+            pairingID: pairingID,
+            direction: .watchToMac,
+            key: watchKey
+        )
+        await transport.seed(.init(
+            recordID: projectRequest.context.recordName,
+            envelope: projectRequest,
+            leaseToken: "lease-projects",
+            leaseExpiresAt: Date().addingTimeInterval(90)
+        ))
+        let drainedProjects = try await consumer.drainOnce(waitSeconds: 0)
+        precondition(drainedProjects)
+        let afterProjects = await transport.snapshot()
+        let projectPayload = try CloudRelayProtocol.open(
+            afterProjects.published.last!, expectedDirection: .macToWatch, key: watchKey
+        )
+        let projectResponse = try projectPayload.decode(CloudProjectListResponse.self)
+        precondition(projectResponse.requestID == projectRequestID)
+        precondition(projectResponse.projects.map(\.name) == [
+            "PLATFORM ENGINEERING", "MUSIC SYSTEMS"
+        ])
+        precondition(projectResponse.projects[1].path == "/projects/ScoreIR")
 
         let conversationRequestID = UUID()
         let conversationRequest = try CloudRelayProtocol.seal(

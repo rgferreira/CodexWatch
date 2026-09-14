@@ -129,6 +129,7 @@ final class BridgeController: ObservableObject {
     @Published private(set) var status = "Iniciando…"
     @Published private(set) var connectionState: BridgeConnectionState = .unavailable
     @Published private(set) var tasks: [CodexTask] = []
+    @Published private(set) var projects: [CodexProject] = []
     @Published private(set) var accessToken = ""
     @Published private(set) var hasOpenAIAPIKey = false
     @Published private(set) var cloudRelayStatus = "No configurado"
@@ -146,6 +147,7 @@ final class BridgeController: ObservableObject {
     private var refreshInProgress = false
     private var creationInProgress = false
     private var hasLoadedTasks = false
+    private var hasLoadedProjects = false
     private var lastSuccessfulCompanionContact: Date?
     private var lastSuccessfulCloudWatchContact: Date?
     private var cloudProvisioning: BridgeCloudRelayProvisioning?
@@ -389,6 +391,12 @@ final class BridgeController: ObservableObject {
         case ("GET", "/tasks"):
             await refreshTasks()
             return .encodable(tasks)
+        case ("GET", "/projects"):
+            do {
+                return .encodable(try await cloudProjectsSnapshot(forceRefresh: true))
+            } catch {
+                return .serverError()
+            }
         case ("POST", "/tasks"):
             guard let command = try? CodexWatchWire.decode(NewTaskCommand.self, from: request.body) else {
                 return .badRequest
@@ -409,9 +417,8 @@ final class BridgeController: ObservableObject {
                 case .started:
                     telemetry(correlationID, threadID: operationThread, operation: "create", origin: origin(for: request), result: "start")
                 }
-                if let projectPath = command.projectPath,
-                   !projectPath.isEmpty,
-                   !tasks.contains(where: { $0.projectPath == projectPath }) {
+                _ = try await cloudProjectsSnapshot(forceRefresh: true)
+                if !projectSelectionIsCurrent(command) {
                     throw NSError(
                         domain: "CodexWatch",
                         code: 4,
@@ -848,6 +855,10 @@ final class BridgeController: ObservableObject {
                     guard let self else { throw CancellationError() }
                     return try await self.cloudTasksSnapshot()
                 },
+                listProjects: { [weak self] in
+                    guard let self else { throw CancellationError() }
+                    return try await self.cloudProjectsSnapshot(forceRefresh: true)
+                },
                 readConversation: { [weak self] taskID in
                     guard let self else { throw CancellationError() }
                     return try await self.appServer.recentMessages(threadID: taskID)
@@ -971,6 +982,14 @@ final class BridgeController: ObservableObject {
         return tasks
     }
 
+    private func cloudProjectsSnapshot(forceRefresh: Bool = false) async throws -> [CodexProject] {
+        if forceRefresh || !hasLoadedProjects {
+            projects = try await appServer.listProjects()
+            hasLoadedProjects = true
+        }
+        return projects
+    }
+
     private func deliverCloudNewTask(
         _ command: NewTaskCommand
     ) async -> BridgeCloudMailboxConsumer.DeliveryOutcome {
@@ -993,9 +1012,8 @@ final class BridgeController: ObservableObject {
             break
         }
         do {
-            if let projectPath = command.projectPath,
-               !projectPath.isEmpty,
-               !tasks.contains(where: { $0.projectPath == projectPath }) {
+            _ = try await cloudProjectsSnapshot(forceRefresh: true)
+            if !projectSelectionIsCurrent(command) {
                 throw NSError(
                     domain: "CodexWatch",
                     code: 4,
@@ -1022,6 +1040,16 @@ final class BridgeController: ObservableObject {
             remember(receipt)
             return .rejected(receipt.message)
         }
+    }
+
+    private func projectSelectionIsCurrent(_ command: NewTaskCommand) -> Bool {
+        let projectID = command.projectID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let projectPath = command.projectPath?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if projectID.isEmpty {
+            return projectPath.isEmpty || projects.contains { $0.path == projectPath }
+        }
+        guard let project = projects.first(where: { $0.id == projectID }) else { return false }
+        return projectPath.isEmpty || project.path == projectPath
     }
 
     private func deliverCloudVoice(

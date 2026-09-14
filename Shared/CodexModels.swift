@@ -16,6 +16,12 @@ struct CodexTask: Codable, Identifiable, Hashable, Sendable {
     let state: State
 }
 
+struct CodexProject: Codable, Identifiable, Hashable, Sendable {
+    let id: String
+    let name: String
+    let path: String
+}
+
 struct CodexMessage: Codable, Identifiable, Hashable, Sendable {
     enum Role: String, Codable, Sendable {
         case user
@@ -43,6 +49,16 @@ struct CloudTaskListResponse: Codable, Hashable, Sendable {
     let revision: Date
 }
 
+struct CloudProjectListRequest: Codable, Hashable, Sendable {
+    let requestedAt: Date
+}
+
+struct CloudProjectListResponse: Codable, Hashable, Sendable {
+    let requestID: UUID
+    let projects: [CodexProject]
+    let revision: Date
+}
+
 struct CloudConversationRequest: Codable, Hashable, Sendable {
     let taskID: String
     let revision: Date
@@ -57,6 +73,7 @@ struct CloudConversationResponse: Codable, Hashable, Sendable {
 struct CloudReadFailure: Codable, Hashable, Sendable {
     enum Kind: String, Codable, Sendable {
         case tasks
+        case projects
         case conversation
     }
 
@@ -93,29 +110,31 @@ struct CodexCommand: Codable, Identifiable, Hashable, Sendable {
 struct NewTaskCommand: Codable, Identifiable, Hashable, Sendable {
     let id: UUID
     let prompt: String
+    let projectID: String?
     let projectPath: String?
     let createdAt: Date
 
-    init(prompt: String, projectPath: String?) {
+    init(prompt: String, projectID: String? = nil, projectPath: String?) {
         id = UUID()
         self.prompt = prompt
+        self.projectID = projectID
         self.projectPath = projectPath
         createdAt = Date()
     }
 }
 
 struct ProjectSelectionState: Equatable, Sendable {
-    private(set) var selectedPath = ""
+    private(set) var selectedProjectID = ""
     private(set) var isInitialized = false
 
-    mutating func initializeIfNeeded(projectPaths: [String]) {
-        guard !isInitialized else { return }
-        selectedPath = projectPaths.first ?? ""
+    mutating func initializeIfNeeded(projectIDs: [String]) {
+        guard !isInitialized, let first = projectIDs.first else { return }
+        selectedProjectID = first
         isInitialized = true
     }
 
-    mutating func select(_ path: String) {
-        selectedPath = path
+    mutating func select(_ projectID: String) {
+        selectedProjectID = projectID
         isInitialized = true
     }
 }
@@ -387,6 +406,11 @@ enum CodexWatchWire {
     static let tasksResponse = "codexwatch.tasks.response"
     static let tasksError = "codexwatch.tasks.error"
     static let tasksRevision = "codexwatch.tasks.revision"
+    static let projects = "codexwatch.projects"
+    static let projectsRequest = "codexwatch.projects.request"
+    static let projectsResponse = "codexwatch.projects.response"
+    static let projectsError = "codexwatch.projects.error"
+    static let projectsRevision = "codexwatch.projects.revision"
     static let command = "codexwatch.command"
     static let newTaskCommand = "codexwatch.task.create"
     static let commandReceipt = "codexwatch.command.receipt"

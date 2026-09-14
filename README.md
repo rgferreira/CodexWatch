@@ -23,7 +23,7 @@ The menu bar icon reports end-to-end connection status: green only after a recen
 
 The Watch task list requests a fresh snapshot when opened and every 10 seconds while visible. The WatchConnectivity request wakes the iPhone companion, which queries the bridge and responds directly to the Watch; the iPhone also refreshes its copy every 15 seconds whenever the app can run. Every change is additionally sent as a persistent, versioned, and deduplicated snapshot: the Watch receives the newest list even if the immediate message fails and discards stale deliveries. The iPhone retains the last valid list so it cannot overwrite the Watch with an empty cache when resuming in the background.
 
-The `+` icon in the top corner of the task list creates a new task. The Watch suggests the project from the most recent task, lets you choose another project or no project, collects the request through dictation, and submits one idempotent domain operation to Relay's Controller.
+The `+` icon in the top corner of the task list creates a new task. Its picker mirrors the canonical local project catalog and visible names from Codex Desktop, including projects with no recent tasks, with one row per project identity rather than per folder. The Watch lets you choose a project or no project, collects the request through dictation, and submits one idempotent domain operation to Relay's Controller using the stable project ID.
 
 ## Voice commands
 

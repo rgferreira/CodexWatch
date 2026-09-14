@@ -14,6 +14,7 @@ actor BridgeCloudMailboxConsumer {
     typealias Deliver = @Sendable (CodexCommand) async -> DeliveryOutcome
     typealias CreateTask = @Sendable (NewTaskCommand) async -> DeliveryOutcome
     typealias ListTasks = @Sendable () async throws -> [CodexTask]
+    typealias ListProjects = @Sendable () async throws -> [CodexProject]
     typealias ReadConversation = @Sendable (String) async throws -> [CodexMessage]
     typealias DeliverVoice = @Sendable (CodexVoiceCommand, Data) async -> DeliveryOutcome
     typealias OperationStatus = @Sendable (UUID) async throws -> String
@@ -33,6 +34,7 @@ actor BridgeCloudMailboxConsumer {
     private let deliver: Deliver
     private let createTask: CreateTask
     private let listTasks: ListTasks
+    private let listProjects: ListProjects
     private let readConversation: ReadConversation
     private let deliverVoice: DeliverVoice
     private let voiceInbox: CloudVoiceInbox
@@ -48,6 +50,7 @@ actor BridgeCloudMailboxConsumer {
         deliver: @escaping Deliver,
         createTask: @escaping CreateTask = { _ in .rejected("Creación directa no disponible") },
         listTasks: @escaping ListTasks = { [] },
+        listProjects: @escaping ListProjects = { [] },
         readConversation: @escaping ReadConversation = { _ in [] },
         deliverVoice: @escaping DeliverVoice = { _, _ in .rejected("Voz directa no disponible") },
         voiceInbox: CloudVoiceInbox? = nil,
@@ -65,6 +68,7 @@ actor BridgeCloudMailboxConsumer {
         self.deliver = deliver
         self.createTask = createTask
         self.listTasks = listTasks
+        self.listProjects = listProjects
         self.readConversation = readConversation
         self.deliverVoice = deliverVoice
         self.voiceInbox = try voiceInbox ?? CloudVoiceInbox()
@@ -158,6 +162,35 @@ actor BridgeCloudMailboxConsumer {
                     kind: .tasks,
                     taskID: nil,
                     message: "El Mac no pudo actualizar las tareas"
+                )
+            }
+            try await acknowledge(claim)
+            return true
+        case .projectListRequest:
+            _ = try payload.decode(CloudProjectListRequest.self)
+            do {
+                let projects = try await listProjects()
+                try await publish(
+                    commandID: payload.commandID,
+                    operation: .projectListResponse,
+                    body: CloudProjectListResponse(
+                        requestID: payload.commandID,
+                        projects: projects,
+                        revision: Date()
+                    )
+                )
+                Self.audit(
+                    "codexwatch_mailbox_receive correlation=\(correlationID) operation=project-list result=success count=\(projects.count)"
+                )
+            } catch {
+                Self.audit(
+                    "codexwatch_mailbox_receive correlation=\(correlationID) operation=project-list result=failure error=\(String(describing: type(of: error)))"
+                )
+                try await publishReadFailure(
+                    requestID: payload.commandID,
+                    kind: .projects,
+                    taskID: nil,
+                    message: "El Mac no pudo actualizar los proyectos"
                 )
             }
             try await acknowledge(claim)

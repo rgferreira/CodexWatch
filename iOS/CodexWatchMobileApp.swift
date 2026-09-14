@@ -224,6 +224,7 @@ final class PhoneRelay: NSObject, ObservableObject {
     static let shared = PhoneRelay()
 
     @Published private(set) var tasks: [CodexTask] = []
+    @Published private(set) var projects: [CodexProject] = []
     @Published private(set) var statusMessage = "Esperando al puente del Mac"
     @Published private(set) var isConnected = false
     @Published private(set) var isConnecting = false
@@ -244,12 +245,14 @@ final class PhoneRelay: NSObject, ObservableObject {
     private var hasLoadedTasks = false
     private var refreshInProgress = false
     private var lastDurableTasksData: Data?
+    private var lastDurableProjectsData: Data?
     private var lastDurableVoiceInputMode: String?
     private var lastDurableTranscriptionModel: String?
     private static let tokenService = "com.rgferreira.CodexWatch"
     private static let tokenAccount = "bridge-access-token"
     private static let cachedTasksKey = "cachedTasks"
     private static let cachedTasksRevisionKey = "cachedTasksRevision"
+    private static let cachedProjectsKey = "cachedProjects"
 
     private override init() {
         let defaults = UserDefaults.standard
@@ -274,6 +277,10 @@ final class PhoneRelay: NSObject, ObservableObject {
             tasks = cachedTasks.sorted { $0.updatedAt > $1.updatedAt }
             tasksRevision = defaults.double(forKey: Self.cachedTasksRevisionKey)
             hasLoadedTasks = true
+        }
+        if let cachedData = defaults.data(forKey: Self.cachedProjectsKey),
+           let cachedProjects = try? CodexWatchWire.decode([CodexProject].self, from: cachedData) {
+            projects = cachedProjects
         }
         defaults.removeObject(forKey: "pairingCode")
         super.init()
@@ -349,7 +356,14 @@ final class PhoneRelay: NSObject, ObservableObject {
             for candidate in candidates {
                 statusMessage = "Conectando con el Mac…"
                 do {
-                    received = try await MacBridgeClient(baseURL: candidate, token: accessToken).fetchTasks()
+                    let client = MacBridgeClient(baseURL: candidate, token: accessToken)
+                    received = try await client.fetchTasks()
+                    if let catalog = try? await client.fetchProjects() {
+                        projects = catalog
+                        if let data = try? CodexWatchWire.encode(catalog) {
+                            UserDefaults.standard.set(data, forKey: Self.cachedProjectsKey)
+                        }
+                    }
                     activeBridgeURL = candidate
                     break
                 } catch {
@@ -390,10 +404,12 @@ final class PhoneRelay: NSObject, ObservableObject {
         guard hasLoadedTasks,
               let session,
               session.activationState == .activated,
-              let data = try? CodexWatchWire.encode(tasks) else { return }
+              let data = try? CodexWatchWire.encode(tasks),
+              let projectsData = try? CodexWatchWire.encode(projects) else { return }
         let context: [String: Any] = [
             CodexWatchWire.tasks: data,
             CodexWatchWire.tasksRevision: tasksRevision,
+            CodexWatchWire.projects: projectsData,
             CodexWatchWire.voiceInputMode: voiceInputMode.rawValue,
             CodexWatchWire.transcriptionModel: transcriptionModel.rawValue
         ]
@@ -401,21 +417,25 @@ final class PhoneRelay: NSObject, ObservableObject {
         if session.isReachable {
             session.sendMessage([
                 CodexWatchWire.tasksResponse: data,
-                CodexWatchWire.tasksRevision: tasksRevision
+                CodexWatchWire.tasksRevision: tasksRevision,
+                CodexWatchWire.projectsResponse: projectsData
             ], replyHandler: nil)
         }
         let mode = voiceInputMode.rawValue
         let model = transcriptionModel.rawValue
         if lastDurableTasksData != data
+            || lastDurableProjectsData != projectsData
             || lastDurableVoiceInputMode != mode
             || lastDurableTranscriptionModel != model {
             session.transferUserInfo([
                 CodexWatchWire.tasksResponse: data,
                 CodexWatchWire.tasksRevision: tasksRevision,
+                CodexWatchWire.projectsResponse: projectsData,
                 CodexWatchWire.voiceInputMode: mode,
                 CodexWatchWire.transcriptionModel: model
             ])
             lastDurableTasksData = data
+            lastDurableProjectsData = projectsData
             lastDurableVoiceInputMode = mode
             lastDurableTranscriptionModel = model
         }
@@ -745,6 +765,26 @@ extension PhoneRelay: WCSessionDelegate {
             }
             return
         }
+        if message[CodexWatchWire.projectsRequest] as? Bool == true {
+            Task { @MainActor [weak self] in
+                guard let self,
+                      let baseURL = activeBridgeURL ?? configuredBridgeURL else {
+                    reply.call([:])
+                    return
+                }
+                do {
+                    let catalog = try await MacBridgeClient(baseURL: baseURL, token: accessToken)
+                        .fetchProjects()
+                    projects = catalog
+                    let data = try CodexWatchWire.encode(catalog)
+                    UserDefaults.standard.set(data, forKey: Self.cachedProjectsKey)
+                    reply.call([CodexWatchWire.projectsResponse: data])
+                } catch {
+                    reply.call([CodexWatchWire.projectsError: Self.describe(error)])
+                }
+            }
+            return
+        }
         guard let taskID = message[CodexWatchWire.conversationRequest] as? String else {
             reply.call([:])
             return
@@ -819,6 +859,22 @@ extension PhoneRelay: WCSessionDelegate {
                     }
                 }
                 await refreshTasks()
+            }
+            return
+        }
+        if userInfo[CodexWatchWire.projectsRequest] as? Bool == true {
+            Task { @MainActor [weak self] in
+                guard let self,
+                      let baseURL = activeBridgeURL ?? configuredBridgeURL,
+                      let catalog = try? await MacBridgeClient(
+                        baseURL: baseURL, token: accessToken
+                      ).fetchProjects(),
+                      let data = try? CodexWatchWire.encode(catalog) else { return }
+                projects = catalog
+                UserDefaults.standard.set(data, forKey: Self.cachedProjectsKey)
+                if let watchSession = self.session {
+                    watchSession.transferUserInfo([CodexWatchWire.projectsResponse: data])
+                }
             }
         }
     }
@@ -957,6 +1013,13 @@ private struct MacBridgeClient: Sendable {
         let (data, response) = try await URLSession.shared.data(for: request)
         try validate(response, data: data)
         return try CodexWatchWire.decode([CodexTask].self, from: data)
+    }
+
+    func fetchProjects() async throws -> [CodexProject] {
+        let request = try request(path: "/projects")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validate(response, data: data)
+        return try CodexWatchWire.decode([CodexProject].self, from: data)
     }
 
     func beginCloudPairing(

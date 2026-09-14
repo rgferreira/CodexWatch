@@ -25,6 +25,8 @@ enum CloudRelayProtocol {
         case heartbeatAck
         case taskListRequest
         case taskListResponse
+        case projectListRequest
+        case projectListResponse
         case conversationRequest
         case conversationResponse
         case readFailure

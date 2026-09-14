@@ -314,30 +314,22 @@ private struct NewTaskView: View {
   @State private var projectSelection = ProjectSelectionState()
   @State private var commandID: UUID?
 
-  private var projectPaths: [String] {
-    relay.tasks
-      .sorted { $0.updatedAt > $1.updatedAt }
-      .compactMap(\.projectPath)
-      .reduce(into: [String]()) { paths, path in
-        if !path.isEmpty, !paths.contains(path) { paths.append(path) }
-      }
-  }
-
   private var receipt: CommandReceipt? {
     guard let commandID else { return nil }
     return relay.commandReceipts[commandID]
   }
 
   private var selectedProjectName: String {
-    guard !projectSelection.selectedPath.isEmpty else {
+    guard !projectSelection.selectedProjectID.isEmpty else {
       return relay.isDemoMode ? "No project" : "Sin proyecto"
     }
-    return URL(fileURLWithPath: projectSelection.selectedPath).lastPathComponent
+    return relay.projects.first(where: { $0.id == projectSelection.selectedProjectID })?.name
+      ?? (relay.isDemoMode ? "No project" : "Sin proyecto")
   }
 
-  private var selectedProjectPath: Binding<String> {
+  private var selectedProjectID: Binding<String> {
     Binding(
-      get: { projectSelection.selectedPath },
+      get: { projectSelection.selectedProjectID },
       set: { projectSelection.select($0) }
     )
   }
@@ -347,15 +339,14 @@ private struct NewTaskView: View {
       Section(relay.isDemoMode ? "Project" : "Proyecto") {
         NavigationLink {
           ProjectSelectionView(
-            projectPaths: projectPaths,
-            selection: selectedProjectPath
+            selection: selectedProjectID
           )
         } label: {
           Label {
             Text(selectedProjectName)
               .lineLimit(2)
           } icon: {
-            Image(systemName: projectSelection.selectedPath.isEmpty ? "folder" : "folder.fill")
+            Image(systemName: projectSelection.selectedProjectID.isEmpty ? "folder" : "folder.fill")
           }
         }
         .accessibilityLabel("Proyecto: \(selectedProjectName)")
@@ -380,11 +371,16 @@ private struct NewTaskView: View {
             .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
 
           Button(relay.isDemoMode ? "Create task" : "Crear tarea") {
-            let projectPath = projectSelection.selectedPath.isEmpty
-              ? nil
-              : projectSelection.selectedPath
+            let projectPath = relay.projects.first(where: {
+              $0.id == projectSelection.selectedProjectID
+            })?.path
             commandID = relay.createTask(
-              NewTaskCommand(prompt: prompt, projectPath: projectPath)
+              NewTaskCommand(
+                prompt: prompt,
+                projectID: projectSelection.selectedProjectID.isEmpty
+                  ? nil : projectSelection.selectedProjectID,
+                projectPath: projectPath
+              )
             )
             WKInterfaceDevice.current().play(.click)
           }
@@ -415,7 +411,11 @@ private struct NewTaskView: View {
     }
     .navigationTitle(relay.isDemoMode ? "New task" : "Nueva tarea")
     .onAppear {
-      projectSelection.initializeIfNeeded(projectPaths: projectPaths)
+      projectSelection.initializeIfNeeded(projectIDs: relay.projects.map(\.id))
+      relay.refreshProjects()
+    }
+    .onChange(of: relay.projects) { _, projects in
+      projectSelection.initializeIfNeeded(projectIDs: projects.map(\.id))
     }
     .task(id: commandID) {
       guard let commandID else { return }
@@ -444,7 +444,6 @@ private struct NewTaskView: View {
 
 private struct ProjectSelectionView: View {
   @EnvironmentObject private var relay: WatchRelay
-  let projectPaths: [String]
   @Binding var selection: String
   @Environment(\.dismiss) private var dismiss
 
@@ -452,11 +451,18 @@ private struct ProjectSelectionView: View {
     List {
       projectButton(
         title: relay.isDemoMode ? "No project" : "Sin proyecto",
-        path: "", systemImage: "folder")
-      ForEach(projectPaths, id: \.self) { path in
+        projectID: "", systemImage: "folder")
+      if relay.projects.isEmpty {
+        HStack(spacing: 8) {
+          ProgressView()
+          Text(relay.isDemoMode ? "Loading projects…" : "Cargando proyectos…")
+            .font(.caption)
+        }
+      }
+      ForEach(relay.projects) { project in
         projectButton(
-          title: URL(fileURLWithPath: path).lastPathComponent,
-          path: path,
+          title: project.name,
+          projectID: project.id,
           systemImage: "folder.fill"
         )
       }
@@ -464,9 +470,9 @@ private struct ProjectSelectionView: View {
     .navigationTitle(relay.isDemoMode ? "Project" : "Proyecto")
   }
 
-  private func projectButton(title: String, path: String, systemImage: String) -> some View {
+  private func projectButton(title: String, projectID: String, systemImage: String) -> some View {
     Button {
-      selection = path
+      selection = projectID
       WKInterfaceDevice.current().play(.click)
       dismiss()
     } label: {
@@ -476,7 +482,7 @@ private struct ProjectSelectionView: View {
         Text(title)
           .lineLimit(2)
         Spacer(minLength: 2)
-        if selection == path {
+        if selection == projectID {
           Image(systemName: "checkmark")
             .foregroundStyle(.green)
         }
@@ -866,6 +872,7 @@ private struct CachedConversation: Codable {
 final class WatchRelay: NSObject, ObservableObject {
   static let shared = WatchRelay()
   @Published private(set) var tasks: [CodexTask] = []
+  @Published private(set) var projects: [CodexProject] = []
   @Published private(set) var conversations: [String: [CodexMessage]] = [:]
   @Published private(set) var loadingConversations: Set<String> = []
   @Published private(set) var conversationErrors: [String: String] = [:]
@@ -889,11 +896,13 @@ final class WatchRelay: NSObject, ObservableObject {
   private var cloudReceiveTask: Task<Void, Never>?
   private var activeTaskRefreshID: UUID?
   private var pendingTaskRequestID: UUID?
+  private var pendingProjectRequestID: UUID?
   private var taskRefreshTimeoutTask: Task<Void, Never>?
   private var pendingConversationRequests: [UUID: (taskID: String, revision: Date)] = [:]
   private var pairingRequestInFlight = false
   private var lastCloudRoundTripAt: Date?
   private static let cachedConversationsKey = "cachedConversations"
+  private static let cachedProjectsKey = "cachedProjects"
   private static let pendingTextCommandOutboxKey = "pendingTextCommandOutbox"
   private var pendingTextCommandOutbox = PendingTextCommandOutbox()
 
@@ -921,6 +930,11 @@ final class WatchRelay: NSObject, ObservableObject {
       conversations = cached.mapValues(\.messages)
       conversationRevisions = cached.mapValues(\.updatedAt)
     }
+    if let data = UserDefaults.standard.data(forKey: Self.cachedProjectsKey),
+      let cached = try? CodexWatchWire.decode([CodexProject].self, from: data)
+    {
+      projects = cached
+    }
   }
 
   func start() {
@@ -936,6 +950,9 @@ final class WatchRelay: NSObject, ObservableObject {
         data,
         revision: session?.receivedApplicationContext[CodexWatchWire.tasksRevision] as? TimeInterval
       )
+    }
+    if let data = session?.receivedApplicationContext[CodexWatchWire.projects] as? Data {
+      applyProjects(data)
     }
     applyVoiceSettings(
       inputModeRawValue: session?.receivedApplicationContext[CodexWatchWire.voiceInputMode] as? String,
@@ -1319,6 +1336,52 @@ final class WatchRelay: NSObject, ObservableObject {
       }
       refreshTasks()
     }
+  }
+
+  func refreshProjects() {
+    guard !isDemoMode else { return }
+    let requestID = UUID()
+    if let cloudClient {
+      startCloudReceiveLoop(cloudClient)
+      pendingProjectRequestID = requestID
+      Task { [weak self] in
+        do {
+          try await cloudClient.requestProjects(requestID: requestID)
+          try await Task.sleep(for: .seconds(15))
+          guard let self, pendingProjectRequestID == requestID else { return }
+          pendingProjectRequestID = nil
+          requestProjectsThroughCompanion()
+        } catch {
+          guard let self, pendingProjectRequestID == requestID else { return }
+          pendingProjectRequestID = nil
+          requestProjectsThroughCompanion()
+        }
+      }
+      return
+    }
+    requestProjectsThroughCompanion()
+  }
+
+  private func requestProjectsThroughCompanion() {
+    guard let session, session.activationState == .activated else { return }
+    if session.isReachable {
+      session.sendMessage(
+        [CodexWatchWire.projectsRequest: true],
+        replyHandler: { [weak self] reply in
+          guard let data = reply[CodexWatchWire.projectsResponse] as? Data else { return }
+          Task { @MainActor [weak self] in self?.applyProjects(data) }
+        },
+        errorHandler: nil
+      )
+    } else {
+      session.transferUserInfo([CodexWatchWire.projectsRequest: true])
+    }
+  }
+
+  private func applyProjects(_ data: Data) {
+    guard let decoded = try? CodexWatchWire.decode([CodexProject].self, from: data) else { return }
+    projects = decoded
+    UserDefaults.standard.set(data, forKey: Self.cachedProjectsKey)
   }
 
   func updatedAt(for taskID: String, fallback: Date) -> Date {
@@ -1734,6 +1797,11 @@ final class WatchRelay: NSObject, ObservableObject {
             pendingTaskRequestID == response.requestID,
             let data = try? CodexWatchWire.encode(response.tasks) else { return }
       applyTasks(data, revision: response.revision.timeIntervalSince1970)
+    case .projects(let response):
+      guard pendingProjectRequestID == response.requestID,
+            let data = try? CodexWatchWire.encode(response.projects) else { return }
+      pendingProjectRequestID = nil
+      applyProjects(data)
     case .conversation(let response):
       guard let pending = pendingConversationRequests.removeValue(
         forKey: response.requestID
@@ -1752,6 +1820,9 @@ final class WatchRelay: NSObject, ObservableObject {
           forKey: failure.requestID
         ) else { return }
         failConversation(for: pending.taskID, message: failure.message)
+      case .projects where pendingProjectRequestID == failure.requestID:
+        pendingProjectRequestID = nil
+        requestProjectsThroughCompanion()
       default:
         break
       }
@@ -1779,6 +1850,16 @@ final class WatchRelay: NSObject, ObservableObject {
 
   private func prepareDemo() {
     let now = Date()
+    projects = [
+      CodexProject(
+        id: "demo-product", name: "PRODUCT LAUNCH",
+        path: "/demo/product-launch"
+      ),
+      CodexProject(
+        id: "demo-platform", name: "PLATFORM ENGINEERING",
+        path: "/demo/platform"
+      )
+    ]
     tasks = [
       CodexTask(
         id: "demo-launch", title: "Prepare the Aurora launch",
@@ -1859,6 +1940,7 @@ extension WatchRelay: WCSessionDelegate {
     Task { @MainActor [weak self] in
       self?.companionReachable = isReachable
       self?.refreshTasks()
+      self?.refreshProjects()
       self?.requestCloudPairingIfNeeded()
     }
   }
@@ -1867,27 +1949,32 @@ extension WatchRelay: WCSessionDelegate {
     _ session: WCSession, didReceiveApplicationContext applicationContext: [String: Any]
   ) {
     let tasksData = applicationContext[CodexWatchWire.tasks] as? Data
+    let projectsData = applicationContext[CodexWatchWire.projects] as? Data
     let tasksRevision = applicationContext[CodexWatchWire.tasksRevision] as? TimeInterval
     let inputMode = applicationContext[CodexWatchWire.voiceInputMode] as? String
     let transcriptionModel = applicationContext[CodexWatchWire.transcriptionModel] as? String
     Task { @MainActor [weak self] in
       if let tasksData { self?.applyTasks(tasksData, revision: tasksRevision) }
+      if let projectsData { self?.applyProjects(projectsData) }
       self?.applyVoiceSettings(inputModeRawValue: inputMode, modelRawValue: transcriptionModel)
     }
   }
 
   nonisolated func session(_ session: WCSession, didReceiveMessage message: [String: Any]) {
     let tasksData = message[CodexWatchWire.tasksResponse] as? Data
+    let projectsData = message[CodexWatchWire.projectsResponse] as? Data
     let tasksRevision = message[CodexWatchWire.tasksRevision] as? TimeInterval
     let receiptData = message[CodexWatchWire.commandReceipt] as? Data
     Task { @MainActor [weak self] in
       if let tasksData { self?.applyTasks(tasksData, revision: tasksRevision) }
+      if let projectsData { self?.applyProjects(projectsData) }
       if let receiptData { self?.applyCommandReceipt(receiptData) }
     }
   }
 
   nonisolated func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
     let tasksData = userInfo[CodexWatchWire.tasksResponse] as? Data
+    let projectsData = userInfo[CodexWatchWire.projectsResponse] as? Data
     let tasksRevision = userInfo[CodexWatchWire.tasksRevision] as? TimeInterval
     let inputMode = userInfo[CodexWatchWire.voiceInputMode] as? String
     let transcriptionModel = userInfo[CodexWatchWire.transcriptionModel] as? String
@@ -1896,6 +1983,7 @@ extension WatchRelay: WCSessionDelegate {
     let pairingResultData = userInfo[CodexWatchWire.cloudPairingResult] as? Data
     Task { @MainActor [weak self] in
       if let tasksData { self?.applyTasks(tasksData, revision: tasksRevision) }
+      if let projectsData { self?.applyProjects(projectsData) }
       self?.applyVoiceSettings(
         inputModeRawValue: inputMode,
         modelRawValue: transcriptionModel
@@ -1916,6 +2004,7 @@ extension WatchRelay: WCSessionDelegate {
       self?.companionReachable = isReachable
       guard isReachable else { return }
       self?.refreshTasks()
+      self?.refreshProjects()
       self?.requestCloudPairingIfNeeded()
     }
   }
