@@ -23,6 +23,9 @@ actor BridgeCloudMailboxConsumer {
         subsystem: "com.rgferreira.CodexWatchBridge",
         category: "HTTPSMailbox"
     )
+    private static func audit(_ message: String) {
+        FileHandle.standardError.write(Data((message + "\n").utf8))
+    }
     private let transport: any BlindMailboxTransport
     private let outbox: CloudRelayOutbox
     private let pairingID: String
@@ -85,6 +88,10 @@ actor BridgeCloudMailboxConsumer {
             expectedDirection: .watchToMac,
             key: key
         )
+        let correlationID = payload.commandID.uuidString.lowercased()
+        Self.audit(
+            "codexwatch_mailbox_receive correlation=\(correlationID) operation=\(payload.operation.rawValue) result=start"
+        )
         if payload.operation == .heartbeat {
             let value = try payload.decode(CloudRelayProtocol.Heartbeat.self)
             await heartbeat(value.sentAt)
@@ -139,7 +146,13 @@ actor BridgeCloudMailboxConsumer {
                         revision: revision
                     )
                 )
+                Self.audit(
+                    "codexwatch_mailbox_receive correlation=\(correlationID) operation=task-list result=success count=\(tasks.count)"
+                )
             } catch {
+                Self.audit(
+                    "codexwatch_mailbox_receive correlation=\(correlationID) operation=task-list result=failure error=\(String(describing: type(of: error)))"
+                )
                 try await publishReadFailure(
                     requestID: payload.commandID,
                     kind: .tasks,
@@ -162,7 +175,13 @@ actor BridgeCloudMailboxConsumer {
                         revision: request.revision
                     )
                 )
+                Self.audit(
+                    "codexwatch_mailbox_receive correlation=\(correlationID) thread=\(request.taskID) operation=conversation-read result=success count=\(messages.count)"
+                )
             } catch {
+                Self.audit(
+                    "codexwatch_mailbox_receive correlation=\(correlationID) thread=\(request.taskID) operation=conversation-read result=failure error=\(String(describing: type(of: error)))"
+                )
                 try await publishReadFailure(
                     requestID: payload.commandID,
                     kind: .conversation,

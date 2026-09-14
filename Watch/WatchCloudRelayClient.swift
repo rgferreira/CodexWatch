@@ -37,17 +37,11 @@ actor WatchCloudRelayClient {
     }
 
     func send(_ command: CodexCommand) async throws {
-        let payload = try CloudRelayProtocol.SealedPayload(
+        try await put(
             commandID: command.id,
             operation: .textCommand,
             body: command
         )
-        try await transport.put(CloudRelayProtocol.seal(
-            payload: payload,
-            pairingID: pairingID,
-            direction: .watchToMac,
-            key: key
-        ))
     }
 
     func createTask(_ command: NewTaskCommand) async throws {
@@ -114,7 +108,7 @@ actor WatchCloudRelayClient {
             operation: .heartbeat,
             body: CloudRelayProtocol.Heartbeat(sentAt: Date())
         )
-        try await transport.put(CloudRelayProtocol.seal(
+        try await putWithShortRetry(CloudRelayProtocol.seal(
             payload: payload,
             pairingID: pairingID,
             direction: .watchToMac,
@@ -192,13 +186,37 @@ actor WatchCloudRelayClient {
             operation: operation,
             body: body
         )
-        try await transport.put(CloudRelayProtocol.seal(
+        try await putWithShortRetry(CloudRelayProtocol.seal(
             payload: payload,
             pairingID: pairingID,
             direction: .watchToMac,
             key: key,
             recordDiscriminator: discriminator
         ))
+    }
+
+    private func putWithShortRetry(
+        _ envelope: CloudRelayProtocol.SealedEnvelope
+    ) async throws {
+        let delays: [Duration] = [.seconds(1), .seconds(2), .seconds(4)]
+        var retry = 0
+        while true {
+            do {
+                try await transport.put(envelope)
+                return
+            } catch BlindMailboxHTTPClient.ClientError.rateLimited where retry < delays.count {
+                try await Task.sleep(for: delays[retry])
+                retry += 1
+            } catch BlindMailboxHTTPClient.ClientError.unavailable where retry < delays.count {
+                try await Task.sleep(for: delays[retry])
+                retry += 1
+            } catch let error as URLError where retry < delays.count
+                && [.timedOut, .networkConnectionLost, .notConnectedToInternet]
+                    .contains(error.code) {
+                try await Task.sleep(for: delays[retry])
+                retry += 1
+            }
+        }
     }
 
     private func putWithRetry<T: Encodable>(

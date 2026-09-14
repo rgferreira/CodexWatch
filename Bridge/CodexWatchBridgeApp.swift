@@ -145,6 +145,7 @@ final class BridgeController: ObservableObject {
     private var isCodexReady = false
     private var refreshInProgress = false
     private var creationInProgress = false
+    private var hasLoadedTasks = false
     private var lastSuccessfulCompanionContact: Date?
     private var lastSuccessfulCloudWatchContact: Date?
     private var cloudProvisioning: BridgeCloudRelayProvisioning?
@@ -238,6 +239,7 @@ final class BridgeController: ObservableObject {
         defer { refreshInProgress = false }
         do {
             tasks = try await appServer.listTasks()
+            hasLoadedTasks = true
             isCodexReady = true
         } catch {
             isCodexReady = false
@@ -876,6 +878,9 @@ final class BridgeController: ObservableObject {
                         return
                     } catch {
                         self?.cloudRelayStatus = "HTTPS temporalmente no disponible"
+                        Self.audit(
+                            "codexwatch_cloud_consumer_error type=\(String(describing: type(of: error)))"
+                        )
                         try? await Task.sleep(for: .seconds(delay))
                         delay = min(delay * 2, 30)
                     }
@@ -949,11 +954,21 @@ final class BridgeController: ObservableObject {
     }
 
     private func cloudTasksSnapshot() async throws -> [CodexTask] {
-        let snapshot = try await appServer.listTasks()
-        tasks = snapshot
-        isCodexReady = true
-        updateReadiness()
-        return snapshot
+        // The Bridge already owns the periodic Controller refresh. Serving the
+        // Watch from that read model keeps the single mailbox consumer free for
+        // conversation reads, commands and heartbeats instead of stacking a
+        // second expensive /v1/threads request every ten seconds.
+        if !hasLoadedTasks {
+            await refreshTasks()
+        }
+        guard hasLoadedTasks else {
+            throw NSError(
+                domain: "CodexWatch",
+                code: 5,
+                userInfo: [NSLocalizedDescriptionKey: "Las tareas todavía no están disponibles"]
+            )
+        }
+        return tasks
     }
 
     private func deliverCloudNewTask(

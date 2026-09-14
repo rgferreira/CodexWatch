@@ -925,9 +925,10 @@ final class WatchRelay: NSObject, ObservableObject {
 
   func start() {
     guard !isDemoMode else { return }
-    guard session?.delegate == nil else { return }
-    session?.delegate = self
-    session?.activate()
+    if session?.delegate == nil {
+      session?.delegate = self
+      session?.activate()
+    }
     companionReachable = session?.isReachable == true
     configureExistingCloudTransport()
     if let data = session?.receivedApplicationContext[CodexWatchWire.tasks] as? Data {
@@ -997,8 +998,7 @@ final class WatchRelay: NSObject, ObservableObject {
           cloudTransportStatus = "Conexión directa activa"
         } catch {
           guard let self else { return }
-          isCloudTransportActive = false
-          cloudTransportStatus = "HTTPS directo falló · usando iPhone"
+          markCloudOperationFailure("HTTPS directo falló · usando iPhone")
           setCommandReceipt(CommandReceipt(
             commandID: command.id,
             state: .queued,
@@ -1096,8 +1096,7 @@ final class WatchRelay: NSObject, ObservableObject {
           )
         } catch {
           guard let self else { return }
-          isCloudTransportActive = false
-          cloudTransportStatus = "HTTPS directo falló · usando iPhone"
+          markCloudOperationFailure("HTTPS directo falló · usando iPhone")
           sendNewTaskThroughCompanion(commandID: command.id, data: data)
         }
       }
@@ -1162,8 +1161,7 @@ final class WatchRelay: NSObject, ObservableObject {
           )
         } catch {
           guard let self else { return }
-          isCloudTransportActive = false
-          cloudTransportStatus = "Falló el audio HTTPS directo"
+          markCloudOperationFailure("Falló el audio HTTPS directo")
           try? FileManager.default.removeItem(at: fileURL)
           commandReceipts[command.id] = CommandReceipt(
             commandID: command.id,
@@ -1231,10 +1229,11 @@ final class WatchRelay: NSObject, ObservableObject {
       return
     }
     if let cloudClient {
+      startCloudReceiveLoop(cloudClient)
       pendingTaskRequestID = requestID
       taskRefreshTimeoutTask = Task { [weak self] in
         do {
-          try await Task.sleep(for: .seconds(30))
+          try await Task.sleep(for: .seconds(15))
         } catch {
           return
         }
@@ -1242,7 +1241,7 @@ final class WatchRelay: NSObject, ObservableObject {
         pendingTaskRequestID = nil
         taskRefreshTimeoutTask = nil
         if companionReachable {
-          cloudTransportStatus = "HTTPS sin respuesta · usando iPhone"
+          markCloudOperationFailure("HTTPS sin respuesta · usando iPhone")
           refreshTasksThroughCompanion(requestID: requestID)
         } else {
           finishTaskRefreshAttempt(
@@ -1260,7 +1259,7 @@ final class WatchRelay: NSObject, ObservableObject {
           taskRefreshTimeoutTask = nil
           pendingTaskRequestID = nil
           if companionReachable {
-            cloudTransportStatus = "HTTPS directo falló · usando iPhone"
+            markCloudOperationFailure("HTTPS directo falló · usando iPhone")
             refreshTasksThroughCompanion(requestID: requestID)
           } else {
             finishTaskRefreshAttempt(
@@ -1331,6 +1330,7 @@ final class WatchRelay: NSObject, ObservableObject {
     if let loadedRevision = conversationRevisions[taskID], loadedRevision >= revision { return }
     guard !loadingConversations.contains(taskID) else { return }
     if let cloudClient {
+      startCloudReceiveLoop(cloudClient)
       loadingConversations.insert(taskID)
       conversationErrors[taskID] = nil
       let requestID = UUID()
@@ -1342,12 +1342,12 @@ final class WatchRelay: NSObject, ObservableObject {
             taskID: taskID,
             revision: revision
           )
-          try await Task.sleep(for: .seconds(30))
+          try await Task.sleep(for: .seconds(15))
           guard let self,
                 let pending = pendingConversationRequests.removeValue(forKey: requestID) else { return }
           loadingConversations.remove(pending.taskID)
           if companionReachable {
-            cloudTransportStatus = "HTTPS sin respuesta · usando iPhone"
+            markCloudOperationFailure("HTTPS sin respuesta · usando iPhone")
             loadConversationThroughCompanion(
               taskID: pending.taskID,
               revision: pending.revision
@@ -1360,7 +1360,7 @@ final class WatchRelay: NSObject, ObservableObject {
                 let pending = pendingConversationRequests.removeValue(forKey: requestID) else { return }
           loadingConversations.remove(pending.taskID)
           if companionReachable {
-            cloudTransportStatus = "HTTPS directo falló · usando iPhone"
+            markCloudOperationFailure("HTTPS directo falló · usando iPhone")
             loadConversationThroughCompanion(
               taskID: pending.taskID,
               revision: pending.revision
@@ -1634,7 +1634,10 @@ final class WatchRelay: NSObject, ObservableObject {
   }
 
   private func configureExistingCloudTransport() {
-    guard cloudClient == nil else { return }
+    if let cloudClient {
+      startCloudReceiveLoop(cloudClient)
+      return
+    }
     do {
       let material: (
         pairing: CloudRelayProtocol.PairingMaterial,
@@ -1676,10 +1679,12 @@ final class WatchRelay: NSObject, ObservableObject {
   }
 
   private func startCloudReceiveLoop(_ client: WatchCloudRelayClient) {
-    cloudReceiveTask?.cancel()
+    guard cloudReceiveTask == nil else { return }
     cloudReceiveTask = Task { [weak self] in
+      defer { self?.cloudReceiveTask = nil }
       var delay: UInt64 = 2
       var lastHeartbeatSentAt = Date.distantPast
+      var consecutiveFailures = 0
       while !Task.isCancelled {
         do {
           if Date().timeIntervalSince(lastHeartbeatSentAt) >= 45 {
@@ -1689,6 +1694,7 @@ final class WatchRelay: NSObject, ObservableObject {
           let events = try await client.receiveOnce(waitSeconds: 20)
           guard let self else { return }
           for event in events { applyCloudEvent(event) }
+          consecutiveFailures = 0
           if let lastCloudRoundTripAt,
              Date().timeIntervalSince(lastCloudRoundTripAt) <= 90 {
             isCloudTransportActive = true
@@ -1701,8 +1707,16 @@ final class WatchRelay: NSObject, ObservableObject {
         } catch is CancellationError {
           return
         } catch {
-          self?.isCloudTransportActive = false
-          self?.cloudTransportStatus = "HTTPS sin respuesta · reintentando"
+          consecutiveFailures += 1
+          if let self {
+            let recentlyActive = lastCloudRoundTripAt.map {
+              Date().timeIntervalSince($0) <= 90
+            } ?? false
+            if !recentlyActive || consecutiveFailures >= 2 {
+              isCloudTransportActive = false
+              cloudTransportStatus = "HTTPS sin respuesta · reintentando"
+            }
+          }
           try? await Task.sleep(for: .seconds(delay))
           delay = min(delay * 2, 30)
         }
@@ -1711,6 +1725,7 @@ final class WatchRelay: NSObject, ObservableObject {
   }
 
   private func applyCloudEvent(_ event: WatchCloudRelayClient.Event) {
+    markCloudRoundTrip()
     switch event {
     case .receipt(let receipt):
       setCommandReceipt(receipt)
@@ -1741,9 +1756,24 @@ final class WatchRelay: NSObject, ObservableObject {
         break
       }
     case .heartbeatAck:
-      lastCloudRoundTripAt = Date()
+      break
+    }
+  }
+
+  private func markCloudRoundTrip() {
+    lastCloudRoundTripAt = Date()
+    isCloudTransportActive = true
+    cloudTransportStatus = "Conexión directa activa"
+  }
+
+  private func markCloudOperationFailure(_ message: String) {
+    if let lastCloudRoundTripAt,
+       Date().timeIntervalSince(lastCloudRoundTripAt) <= 90 {
       isCloudTransportActive = true
       cloudTransportStatus = "Conexión directa activa"
+    } else {
+      isCloudTransportActive = false
+      cloudTransportStatus = message
     }
   }
 
