@@ -265,15 +265,13 @@ struct TaskPickerView: View {
           .accessibilityLabel("Crear nueva tarea")
         }
         ToolbarItem(placement: .topBarTrailing) {
-          if relay.isRefreshingTasks {
-            ProgressView()
-              .controlSize(.mini)
-          } else {
-            Button { relay.refreshTasks() } label: {
-              Image(systemName: "arrow.clockwise")
-            }
-            .accessibilityLabel("Actualizar tareas")
+          Button { relay.refreshTasks(force: true) } label: {
+            Image(systemName: "arrow.clockwise")
           }
+          .accessibilityLabel(
+            relay.isRefreshingTasks ? "Reintentar actualización" : "Actualizar tareas"
+          )
+          .accessibilityValue(relay.isRefreshingTasks ? "Actualizando" : "Preparado")
         }
       }
     }
@@ -889,7 +887,9 @@ final class WatchRelay: NSObject, ObservableObject {
   private var pendingCloudPairingOffer: CloudRelayPairingOffer?
   private var cloudClient: WatchCloudRelayClient?
   private var cloudReceiveTask: Task<Void, Never>?
+  private var activeTaskRefreshID: UUID?
   private var pendingTaskRequestID: UUID?
+  private var taskRefreshTimeoutTask: Task<Void, Never>?
   private var pendingConversationRequests: [UUID: (taskID: String, revision: Date)] = [:]
   private var pairingRequestInFlight = false
   private var lastCloudRoundTripAt: Date?
@@ -1213,69 +1213,96 @@ final class WatchRelay: NSObject, ObservableObject {
     )
   }
 
-  func refreshTasks() {
-    guard !isRefreshingTasks else { return }
+  func refreshTasks(force: Bool = false) {
+    if isRefreshingTasks {
+      guard force else { return }
+      finishTaskRefreshAttempt()
+    }
+    let requestID = UUID()
+    activeTaskRefreshID = requestID
+    isRefreshingTasks = true
+    taskRefreshError = nil
     if isDemoMode {
-      isRefreshingTasks = true
-      taskRefreshError = nil
       Task { [weak self] in
         try? await Task.sleep(for: .milliseconds(650))
-        self?.isRefreshingTasks = false
+        guard let self, activeTaskRefreshID == requestID else { return }
+        finishTaskRefreshAttempt(requestID: requestID)
       }
       return
     }
     if let cloudClient {
-      isRefreshingTasks = true
-      taskRefreshError = nil
-      let requestID = UUID()
       pendingTaskRequestID = requestID
+      taskRefreshTimeoutTask = Task { [weak self] in
+        do {
+          try await Task.sleep(for: .seconds(30))
+        } catch {
+          return
+        }
+        guard let self, activeTaskRefreshID == requestID else { return }
+        pendingTaskRequestID = nil
+        taskRefreshTimeoutTask = nil
+        if companionReachable {
+          cloudTransportStatus = "HTTPS sin respuesta · usando iPhone"
+          refreshTasksThroughCompanion(requestID: requestID)
+        } else {
+          finishTaskRefreshAttempt(
+            requestID: requestID,
+            error: "El Mac no respondió por HTTPS"
+          )
+        }
+      }
       Task { [weak self] in
         do {
           try await cloudClient.requestTasks(requestID: requestID)
-          try await Task.sleep(for: .seconds(30))
-          guard let self, pendingTaskRequestID == requestID else { return }
-          pendingTaskRequestID = nil
-          isRefreshingTasks = false
-          if companionReachable {
-            cloudTransportStatus = "HTTPS sin respuesta · usando iPhone"
-            refreshTasksThroughCompanion()
-          } else {
-            taskRefreshError = "El Mac no respondió por HTTPS"
-          }
         } catch {
-          guard let self, pendingTaskRequestID == requestID else { return }
+          guard let self, activeTaskRefreshID == requestID else { return }
+          taskRefreshTimeoutTask?.cancel()
+          taskRefreshTimeoutTask = nil
           pendingTaskRequestID = nil
-          isRefreshingTasks = false
           if companionReachable {
             cloudTransportStatus = "HTTPS directo falló · usando iPhone"
-            refreshTasksThroughCompanion()
+            refreshTasksThroughCompanion(requestID: requestID)
           } else {
-            taskRefreshError = "Sin conexión HTTPS directa ni iPhone"
+            finishTaskRefreshAttempt(
+              requestID: requestID,
+              error: "Sin conexión HTTPS directa ni iPhone"
+            )
           }
         }
       }
       return
     }
-    refreshTasksThroughCompanion()
+    refreshTasksThroughCompanion(requestID: requestID)
   }
 
-  private func refreshTasksThroughCompanion() {
+  private func refreshTasksThroughCompanion(requestID: UUID) {
+    guard activeTaskRefreshID == requestID else { return }
     guard let session, session.activationState == .activated else {
-      taskRefreshError = "Conectando con el iPhone…"
+      finishTaskRefreshAttempt(requestID: requestID, error: "Conectando con el iPhone…")
       return
     }
-    isRefreshingTasks = true
-    taskRefreshError = nil
     guard session.isReachable else {
       if lastQueuedTaskRequest.map({ Date().timeIntervalSince($0) > 45 }) ?? true {
         lastQueuedTaskRequest = Date()
         session.transferUserInfo([CodexWatchWire.tasksRequest: true])
       }
-      isRefreshingTasks = false
-      taskRefreshError = "Actualización en segundo plano pendiente"
+      finishTaskRefreshAttempt(
+        requestID: requestID,
+        error: "Actualización en segundo plano pendiente"
+      )
       return
     }
-    let replyHandler = WatchTasksReplyHandler()
+    taskRefreshTimeoutTask?.cancel()
+    taskRefreshTimeoutTask = Task { [weak self] in
+      do {
+        try await Task.sleep(for: .seconds(15))
+      } catch {
+        return
+      }
+      guard let self else { return }
+      finishTaskRefreshAttempt(requestID: requestID, error: "El iPhone no respondió a tiempo")
+    }
+    let replyHandler = WatchTasksReplyHandler(requestID: requestID)
     session.sendMessage(
       [CodexWatchWire.tasksRequest: true],
       replyHandler: replyHandler.receive,
@@ -1387,9 +1414,12 @@ final class WatchRelay: NSObject, ObservableObject {
     conversationErrors[taskID] = message
   }
 
-  fileprivate func finishTaskRefresh(_ data: Data, revision: TimeInterval?) {
-    isRefreshingTasks = false
-    taskRefreshError = nil
+  fileprivate func finishTaskRefresh(
+    _ data: Data,
+    revision: TimeInterval?,
+    requestID: UUID
+  ) {
+    guard activeTaskRefreshID == requestID else { return }
     applyTasks(data, revision: revision)
   }
 
@@ -1423,9 +1453,18 @@ final class WatchRelay: NSObject, ObservableObject {
     UserDefaults.standard.set(data, forKey: Self.pendingTextCommandOutboxKey)
   }
 
-  fileprivate func failTaskRefresh(_ message: String) {
+  fileprivate func failTaskRefresh(_ message: String, requestID: UUID) {
+    finishTaskRefreshAttempt(requestID: requestID, error: message)
+  }
+
+  private func finishTaskRefreshAttempt(requestID: UUID? = nil, error: String? = nil) {
+    if let requestID, activeTaskRefreshID != requestID { return }
+    taskRefreshTimeoutTask?.cancel()
+    taskRefreshTimeoutTask = nil
+    activeTaskRefreshID = nil
+    pendingTaskRequestID = nil
     isRefreshingTasks = false
-    taskRefreshError = message
+    taskRefreshError = error
   }
 
   private func applyTasks(_ data: Data, revision: TimeInterval?) {
@@ -1438,8 +1477,7 @@ final class WatchRelay: NSObject, ObservableObject {
     }
     guard let decoded = try? CodexWatchWire.decode([CodexTask].self, from: data) else { return }
     tasks = decoded.sorted { $0.updatedAt > $1.updatedAt }
-    isRefreshingTasks = false
-    taskRefreshError = nil
+    finishTaskRefreshAttempt()
     lastQueuedTaskRequest = nil
 
     if let mostRecentTask = tasks.first {
@@ -1677,9 +1715,9 @@ final class WatchRelay: NSObject, ObservableObject {
     case .receipt(let receipt):
       setCommandReceipt(receipt)
     case .tasks(let response):
-      guard pendingTaskRequestID == response.requestID,
+      guard activeTaskRefreshID == response.requestID,
+            pendingTaskRequestID == response.requestID,
             let data = try? CodexWatchWire.encode(response.tasks) else { return }
-      pendingTaskRequestID = nil
       applyTasks(data, revision: response.revision.timeIntervalSince1970)
     case .conversation(let response):
       guard let pending = pendingConversationRequests.removeValue(
@@ -1692,10 +1730,8 @@ final class WatchRelay: NSObject, ObservableObject {
       )
     case .readFailure(let failure):
       switch failure.kind {
-      case .tasks where pendingTaskRequestID == failure.requestID:
-        pendingTaskRequestID = nil
-        isRefreshingTasks = false
-        taskRefreshError = failure.message
+      case .tasks where activeTaskRefreshID == failure.requestID:
+        finishTaskRefreshAttempt(requestID: failure.requestID, error: failure.message)
       case .conversation:
         guard let pending = pendingConversationRequests.removeValue(
           forKey: failure.requestID
@@ -1916,23 +1952,38 @@ private final class WatchCloudPairingApprovalReplyHandler: @unchecked Sendable {
 }
 
 private final class WatchTasksReplyHandler: @unchecked Sendable {
+  private let requestID: UUID
+
+  init(requestID: UUID) {
+    self.requestID = requestID
+  }
+
   func receive(_ reply: [String: Any]) {
     if let error = reply[CodexWatchWire.tasksError] as? String, !error.isEmpty {
-      Task { @MainActor in WatchRelay.shared.failTaskRefresh(error) }
+      Task { @MainActor [requestID] in
+        WatchRelay.shared.failTaskRefresh(error, requestID: requestID)
+      }
       return
     }
     guard let data = reply[CodexWatchWire.tasksResponse] as? Data, !data.isEmpty else {
-      Task { @MainActor in
-        WatchRelay.shared.failTaskRefresh("No se pudieron actualizar las tareas")
+      Task { @MainActor [requestID] in
+        WatchRelay.shared.failTaskRefresh(
+          "No se pudieron actualizar las tareas",
+          requestID: requestID
+        )
       }
       return
     }
     let revision = reply[CodexWatchWire.tasksRevision] as? TimeInterval
-    Task { @MainActor in WatchRelay.shared.finishTaskRefresh(data, revision: revision) }
+    Task { @MainActor [requestID] in
+      WatchRelay.shared.finishTaskRefresh(data, revision: revision, requestID: requestID)
+    }
   }
 
   func fail(_ error: Error) {
-    Task { @MainActor in WatchRelay.shared.failTaskRefresh("iPhone no disponible") }
+    Task { @MainActor [requestID] in
+      WatchRelay.shared.failTaskRefresh("iPhone no disponible", requestID: requestID)
+    }
   }
 }
 
