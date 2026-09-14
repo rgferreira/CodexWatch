@@ -2,6 +2,7 @@ import Foundation
 
 enum CloudRelayKeyStore {
     private static let service = "com.rgferreira.CodexWatch.CloudRelay.v1"
+    private static func activeAccount(role: String) -> String { "\(role)-active-pairing" }
 
     struct Identity: Codable, Hashable, Sendable {
         let deviceID: String
@@ -53,11 +54,65 @@ enum CloudRelayKeyStore {
     }
 
     static func loadActivePairingID(role: String) -> String? {
-        UserDefaults.standard.string(forKey: "cloudRelay.\(role).activePairingID")
+        if let stored = try? SecureTokenStore.load(
+            service: service,
+            account: activeAccount(role: role)
+        ) {
+            UserDefaults.standard.set(stored, forKey: "cloudRelay.\(role).activePairingID")
+            return stored
+        }
+        guard let legacy = UserDefaults.standard.string(
+            forKey: "cloudRelay.\(role).activePairingID"
+        ) else { return nil }
+        try? SecureTokenStore.save(
+            legacy,
+            service: service,
+            account: activeAccount(role: role)
+        )
+        return legacy
     }
 
     static func setActivePairingID(_ pairingID: String?, role: String) {
         UserDefaults.standard.set(pairingID, forKey: "cloudRelay.\(role).activePairingID")
+        if let pairingID {
+            try? SecureTokenStore.save(
+                pairingID,
+                service: service,
+                account: activeAccount(role: role)
+            )
+        } else {
+            try? SecureTokenStore.delete(
+                service: service,
+                account: activeAccount(role: role)
+            )
+        }
+    }
+
+    static func recoverApprovedPairing(
+        role: String
+    ) throws -> (
+        pairing: CloudRelayProtocol.PairingMaterial,
+        transport: CloudRelayTransportConfiguration
+    )? {
+        let prefix = "\(role)-pairing-"
+        let identifiers = try SecureTokenStore.accounts(service: service)
+            .filter { $0.hasPrefix(prefix) }
+            .map { String($0.dropFirst(prefix.count)) }
+        let candidates = try identifiers.compactMap { pairingID -> (
+            CloudRelayProtocol.PairingMaterial,
+            CloudRelayTransportConfiguration
+        )? in
+            guard let pairing = try loadPairing(role: role, pairingID: pairingID),
+                  pairing.isApproved,
+                  let transport = try loadTransport(role: role, pairingID: pairingID),
+                  transport.pairingID == pairingID else { return nil }
+            return (pairing, transport)
+        }
+        guard let recovered = candidates.max(by: {
+            ($0.0.approvedAt ?? .distantPast) < ($1.0.approvedAt ?? .distantPast)
+        }) else { return nil }
+        setActivePairingID(recovered.0.pairingID, role: role)
+        return (recovered.0, recovered.1)
     }
 
     static func loadTransport(role: String, pairingID: String) throws

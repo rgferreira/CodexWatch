@@ -87,6 +87,31 @@ enum SecureTokenStore {
         }
     }
 
+    static func accounts(service: String) throws -> [String] {
+        let authenticationContext = LAContext()
+        authenticationContext.interactionNotAllowed = true
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: service,
+            kSecMatchLimit: kSecMatchLimitAll,
+            kSecReturnAttributes: true,
+            kSecUseAuthenticationContext: authenticationContext
+        ]
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == errSecItemNotFound { return [] }
+        guard status == errSecSuccess else { throw StoreError.keychain(status) }
+        let rows: [[String: Any]]
+        if let values = result as? [[String: Any]] {
+            rows = values
+        } else if let value = result as? [String: Any] {
+            rows = [value]
+        } else {
+            throw StoreError.invalidStoredValue
+        }
+        return rows.compactMap { $0[kSecAttrAccount as String] as? String }
+    }
+
     static func loadOrCreate(service: String, account: String) throws -> String {
         if let existing = try load(service: service, account: account) { return existing }
         let token = try makeToken()

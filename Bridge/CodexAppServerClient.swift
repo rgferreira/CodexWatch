@@ -186,25 +186,58 @@ final class CodexAppServerClient: @unchecked Sendable {
             guard lines.count > firstIndex else { continue }
             for index in stride(from: lines.count - 1, through: firstIndex, by: -1) {
                 guard !lines[index].isEmpty,
-                      let object = try? JSONSerialization.jsonObject(with: Data(lines[index])) as? [String: Any],
-                      object["type"] as? String == "event_msg",
-                      let payload = object["payload"] as? [String: Any],
-                      let eventType = payload["type"] as? String,
-                      eventType == "user_message" || eventType == "agent_message",
-                      let source = payload["message"] as? String,
-                      let text = watchExcerpt(from: source) else { continue }
-                let role: CodexMessage.Role = eventType == "user_message" ? .user : .assistant
-                let timestamp = object["timestamp"] as? String ?? ""
-                newestFirst.append(CodexMessage(
-                    id: "\(timestamp)-\(eventType)-\(position)-\(index)",
-                    role: role,
-                    text: text,
-                    createdAt: parseRolloutDate(timestamp)
-                ))
+                      let object = try? JSONSerialization.jsonObject(
+                        with: Data(lines[index])
+                      ) as? [String: Any],
+                      let message = watchMessage(
+                        from: object,
+                        fallbackID: "\(position)-\(index)"
+                      ) else { continue }
+                newestFirst.append(message)
                 if newestFirst.count == limit { break }
             }
         }
         return newestFirst.reversed()
+    }
+
+    private static func watchMessage(
+        from object: [String: Any],
+        fallbackID: String
+    ) -> CodexMessage? {
+        guard let payload = object["payload"] as? [String: Any] else { return nil }
+        let recordType = object["type"] as? String
+        let timestamp = object["timestamp"] as? String ?? ""
+        let role: CodexMessage.Role
+        let source: String
+
+        if recordType == "event_msg",
+           let eventType = payload["type"] as? String,
+           eventType == "user_message" || eventType == "agent_message",
+           let message = payload["message"] as? String {
+            role = eventType == "user_message" ? .user : .assistant
+            source = message
+        } else if recordType == "response_item",
+                  payload["type"] as? String == "message",
+                  let rawRole = payload["role"] as? String,
+                  rawRole == "user" || rawRole == "assistant",
+                  let content = payload["content"] as? [[String: Any]] {
+            role = rawRole == "user" ? .user : .assistant
+            source = content.compactMap { item in
+                guard let type = item["type"] as? String,
+                      type == "input_text" || type == "output_text" else { return nil }
+                return item["text"] as? String
+            }.joined(separator: "\n")
+        } else {
+            return nil
+        }
+
+        guard let text = watchExcerpt(from: source) else { return nil }
+        return CodexMessage(
+            id: payload["id"] as? String ?? "\(timestamp)-\(role.rawValue)-\(fallbackID)",
+            role: role,
+            text: text,
+            createdAt: parseRolloutDate(timestamp)
+        )
     }
 
     private static func parseRolloutDate(_ source: String) -> Date {

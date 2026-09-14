@@ -10,12 +10,28 @@ struct RolloutConversationValidation {
         var data = Data(repeating: 0x78, count: 400_000)
         data.append(0x0A)
         for index in 0..<8 {
-            let role = index.isMultiple(of: 2) ? "user_message" : "agent_message"
-            let object: [String: Any] = [
-                "timestamp": "2026-08-14T20:00:0\(index).000Z",
-                "type": "event_msg",
-                "payload": ["type": role, "message": "mensaje \(index)"]
-            ]
+            let object: [String: Any]
+            if index < 4 {
+                let role = index.isMultiple(of: 2) ? "user_message" : "agent_message"
+                object = [
+                    "timestamp": "2026-08-14T20:00:0\(index).000Z",
+                    "type": "event_msg",
+                    "payload": ["type": role, "message": "mensaje \(index)"]
+                ]
+            } else {
+                let role = index.isMultiple(of: 2) ? "user" : "assistant"
+                let textType = role == "user" ? "input_text" : "output_text"
+                object = [
+                    "timestamp": "2026-08-14T20:00:0\(index).000Z",
+                    "type": "response_item",
+                    "payload": [
+                        "id": "message-\(index)",
+                        "type": "message",
+                        "role": role,
+                        "content": [["type": textType, "text": "mensaje \(index)"]]
+                    ]
+                ]
+            }
             data.append(try JSONSerialization.data(withJSONObject: object))
             data.append(0x0A)
         }

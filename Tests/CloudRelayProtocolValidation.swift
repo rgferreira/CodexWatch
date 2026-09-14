@@ -173,6 +173,34 @@ struct CloudRelayProtocolValidation {
                 != CloudRelayProtocol.payloadFingerprint(changedPayload)
         )
 
+        let voiceCommand = CodexVoiceCommand(task: task, transcriptionModel: .gptTranscribe)
+        let voiceChunk = CloudVoiceChunk(
+            command: voiceCommand,
+            chunkIndex: 0,
+            chunkCount: 1,
+            audioSHA256: Data(repeating: 7, count: 32),
+            bytes: Data(repeating: 9, count: CloudVoiceChunk.preferredChunkBytes)
+        )
+        let voicePayload = try CloudRelayProtocol.SealedPayload(
+            commandID: voiceCommand.id,
+            operation: .voiceChunk,
+            body: voiceChunk
+        )
+        let voiceEnvelope = try CloudRelayProtocol.seal(
+            payload: voicePayload,
+            pairingID: pairingID,
+            direction: .watchToMac,
+            key: watchKey,
+            recordDiscriminator: "voice-0-of-1"
+        )
+        let httpEncoder = JSONEncoder()
+        httpEncoder.dateEncodingStrategy = .iso8601
+        let encodedVoiceEnvelope = try httpEncoder.encode(voiceEnvelope)
+        precondition(
+            encodedVoiceEnvelope.count <= 70 * 1_024,
+            "Voice envelope is \(encodedVoiceEnvelope.count) bytes and exceeds the Worker limit"
+        )
+
         print("Cloud relay protocol validation passed")
     }
 

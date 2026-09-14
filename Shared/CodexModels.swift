@@ -33,6 +33,39 @@ struct CodexConversation: Codable, Hashable, Sendable {
     let messages: [CodexMessage]
 }
 
+struct CloudTaskListRequest: Codable, Hashable, Sendable {
+    let requestedAt: Date
+}
+
+struct CloudTaskListResponse: Codable, Hashable, Sendable {
+    let requestID: UUID
+    let tasks: [CodexTask]
+    let revision: Date
+}
+
+struct CloudConversationRequest: Codable, Hashable, Sendable {
+    let taskID: String
+    let revision: Date
+}
+
+struct CloudConversationResponse: Codable, Hashable, Sendable {
+    let requestID: UUID
+    let conversation: CodexConversation
+    let revision: Date
+}
+
+struct CloudReadFailure: Codable, Hashable, Sendable {
+    enum Kind: String, Codable, Sendable {
+        case tasks
+        case conversation
+    }
+
+    let requestID: UUID
+    let kind: Kind
+    let taskID: String?
+    let message: String
+}
+
 struct CodexCommand: Codable, Identifiable, Hashable, Sendable {
     let id: UUID
     let taskID: String
@@ -272,6 +305,20 @@ struct CodexVoiceCommand: Codable, Identifiable, Hashable, Sendable {
     }
 }
 
+struct CloudVoiceChunk: Codable, Hashable, Sendable {
+    static let maximumAudioBytes = 2 * 1_024 * 1_024
+    // This payload is base64-encoded inside the sealed payload and again inside
+    // the HTTP envelope. 20 KiB keeps the final request below the Worker's
+    // 70 KiB hard limit with enough room for metadata and authentication tags.
+    static let preferredChunkBytes = 20 * 1_024
+
+    let command: CodexVoiceCommand
+    let chunkIndex: Int
+    let chunkCount: Int
+    let audioSHA256: Data
+    let bytes: Data
+}
+
 struct CommandReceipt: Codable, Hashable, Sendable {
     enum State: String, Codable, Sendable {
         case queued
@@ -282,6 +329,52 @@ struct CommandReceipt: Codable, Hashable, Sendable {
     let commandID: UUID
     let state: State
     let message: String
+}
+
+struct PendingTextCommandOutbox: Codable, Hashable, Sendable {
+    struct Intent: Codable, Hashable, Sendable {
+        let command: CodexCommand
+        var receipt: CommandReceipt
+    }
+
+    private(set) var intents: [Intent] = []
+
+    mutating func record(_ command: CodexCommand, receipt: CommandReceipt) {
+        intents.removeAll { $0.command.id == command.id }
+        intents.append(Intent(command: command, receipt: receipt))
+        intents.sort { $0.command.createdAt < $1.command.createdAt }
+        if intents.count > 100 {
+            intents.removeFirst(intents.count - 100)
+        }
+    }
+
+    mutating func apply(_ receipt: CommandReceipt) {
+        guard let index = intents.firstIndex(where: { $0.command.id == receipt.commandID }) else {
+            return
+        }
+        if receipt.state == .queued {
+            intents[index].receipt = receipt
+        } else {
+            intents.remove(at: index)
+        }
+    }
+
+    func latest(taskID: String) -> Intent? {
+        intents.last { $0.command.taskID == taskID && $0.receipt.state == .queued }
+    }
+
+    func matching(taskID: String, text: String) -> Intent? {
+        let normalizedText = Self.normalized(text)
+        return intents.last {
+            $0.command.taskID == taskID
+                && $0.receipt.state == .queued
+                && Self.normalized($0.command.text) == normalizedText
+        }
+    }
+
+    static func normalized(_ text: String) -> String {
+        text.split(whereSeparator: \Character.isWhitespace).joined(separator: " ")
+    }
 }
 
 enum CodexWatchWire {

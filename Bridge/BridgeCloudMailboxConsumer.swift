@@ -12,6 +12,10 @@ actor BridgeCloudMailboxConsumer {
     }
 
     typealias Deliver = @Sendable (CodexCommand) async -> DeliveryOutcome
+    typealias CreateTask = @Sendable (NewTaskCommand) async -> DeliveryOutcome
+    typealias ListTasks = @Sendable () async throws -> [CodexTask]
+    typealias ReadConversation = @Sendable (String) async throws -> [CodexMessage]
+    typealias DeliverVoice = @Sendable (CodexVoiceCommand, Data) async -> DeliveryOutcome
     typealias OperationStatus = @Sendable (UUID) async throws -> String
     typealias Heartbeat = @Sendable (Date) async -> Void
 
@@ -24,6 +28,11 @@ actor BridgeCloudMailboxConsumer {
     private let pairingID: String
     private let key: SymmetricKey
     private let deliver: Deliver
+    private let createTask: CreateTask
+    private let listTasks: ListTasks
+    private let readConversation: ReadConversation
+    private let deliverVoice: DeliverVoice
+    private let voiceInbox: CloudVoiceInbox
     private let operationStatus: OperationStatus
     private let heartbeat: Heartbeat
 
@@ -34,6 +43,11 @@ actor BridgeCloudMailboxConsumer {
         localPrivateKey: Data,
         peerPublicKey: Data,
         deliver: @escaping Deliver,
+        createTask: @escaping CreateTask = { _ in .rejected("Creación directa no disponible") },
+        listTasks: @escaping ListTasks = { [] },
+        readConversation: @escaping ReadConversation = { _ in [] },
+        deliverVoice: @escaping DeliverVoice = { _, _ in .rejected("Voz directa no disponible") },
+        voiceInbox: CloudVoiceInbox? = nil,
         operationStatus: @escaping OperationStatus,
         heartbeat: @escaping Heartbeat = { _ in }
     ) throws {
@@ -46,6 +60,11 @@ actor BridgeCloudMailboxConsumer {
             pairingID: pairingID
         )
         self.deliver = deliver
+        self.createTask = createTask
+        self.listTasks = listTasks
+        self.readConversation = readConversation
+        self.deliverVoice = deliverVoice
+        self.voiceInbox = try voiceInbox ?? CloudVoiceInbox()
         self.operationStatus = operationStatus
         self.heartbeat = heartbeat
     }
@@ -69,24 +88,124 @@ actor BridgeCloudMailboxConsumer {
         if payload.operation == .heartbeat {
             let value = try payload.decode(CloudRelayProtocol.Heartbeat.self)
             await heartbeat(value.sentAt)
+            try await publish(
+                commandID: payload.commandID,
+                operation: .heartbeatAck,
+                body: CloudRelayProtocol.HeartbeatAck(
+                    requestID: payload.commandID,
+                    receivedAt: Date()
+                )
+            )
             try await transport.acknowledge(
                 recordID: claim.recordID,
                 leaseToken: claim.leaseToken
             )
             return true
         }
-        guard payload.operation == .textCommand else {
+        switch payload.operation {
+        case .textCommand:
+            let command = try payload.decode(CodexCommand.self)
+            guard command.id == payload.commandID else {
+                throw CloudRelayProtocol.ProtocolError.recordBindingMismatch
+            }
+            return try await handleWrite(
+                commandID: command.id,
+                operation: "text-write",
+                claim: claim,
+                operationBlock: { [deliver] in await deliver(command) }
+            )
+        case .newTaskCommand:
+            let command = try payload.decode(NewTaskCommand.self)
+            guard command.id == payload.commandID else {
+                throw CloudRelayProtocol.ProtocolError.recordBindingMismatch
+            }
+            return try await handleWrite(
+                commandID: command.id,
+                operation: "create",
+                claim: claim,
+                operationBlock: { [createTask] in await createTask(command) }
+            )
+        case .taskListRequest:
+            _ = try payload.decode(CloudTaskListRequest.self)
+            do {
+                let tasks = try await listTasks()
+                let revision = Date()
+                try await publish(
+                    commandID: payload.commandID,
+                    operation: .taskListResponse,
+                    body: CloudTaskListResponse(
+                        requestID: payload.commandID,
+                        tasks: tasks,
+                        revision: revision
+                    )
+                )
+            } catch {
+                try await publishReadFailure(
+                    requestID: payload.commandID,
+                    kind: .tasks,
+                    taskID: nil,
+                    message: "El Mac no pudo actualizar las tareas"
+                )
+            }
+            try await acknowledge(claim)
+            return true
+        case .conversationRequest:
+            let request = try payload.decode(CloudConversationRequest.self)
+            do {
+                let messages = try await readConversation(request.taskID)
+                try await publish(
+                    commandID: payload.commandID,
+                    operation: .conversationResponse,
+                    body: CloudConversationResponse(
+                        requestID: payload.commandID,
+                        conversation: CodexConversation(taskID: request.taskID, messages: messages),
+                        revision: request.revision
+                    )
+                )
+            } catch {
+                try await publishReadFailure(
+                    requestID: payload.commandID,
+                    kind: .conversation,
+                    taskID: request.taskID,
+                    message: "El Mac no pudo cargar la conversación"
+                )
+            }
+            try await acknowledge(claim)
+            return true
+        case .voiceChunk:
+            let chunk = try payload.decode(CloudVoiceChunk.self)
+            guard chunk.command.id == payload.commandID else {
+                throw CloudRelayProtocol.ProtocolError.recordBindingMismatch
+            }
+            do {
+                let completed = try await voiceInbox.ingest(chunk)
+                try await acknowledge(claim)
+                if let completed { try await processVoice(completed) }
+            } catch {
+                try? await voiceInbox.remove(commandID: chunk.command.id)
+                try await publishReceipt(CommandReceipt(
+                    commandID: chunk.command.id,
+                    state: .failed,
+                    message: error.localizedDescription
+                ))
+                try await acknowledge(claim)
+            }
+            return true
+        default:
             throw CloudRelayProtocol.ProtocolError.operationMismatch
         }
-        let command = try payload.decode(CodexCommand.self)
-        guard command.id == payload.commandID else {
-            throw CloudRelayProtocol.ProtocolError.recordBindingMismatch
-        }
-        let correlationID = "mailbox-\(command.id.uuidString.lowercased())"
-        Self.logger.notice(
-            "correlation=\(correlationID, privacy: .public) command=\(command.id.uuidString, privacy: .public) operation=text-write origin=watch-https result=start"
-        )
+    }
 
+    private func handleWrite(
+        commandID: UUID,
+        operation: String,
+        claim: BlindMailboxHTTPClient.ClaimedEnvelope,
+        operationBlock: @escaping @Sendable () async -> DeliveryOutcome
+    ) async throws -> Bool {
+        let correlationID = "mailbox-\(commandID.uuidString.lowercased())"
+        Self.logger.notice(
+            "correlation=\(correlationID, privacy: .public) command=\(commandID.uuidString, privacy: .public) operation=\(operation, privacy: .public) origin=watch-https result=start"
+        )
         let renewal = Task { [transport, recordID = claim.recordID, token = claim.leaseToken] in
             while !Task.isCancelled {
                 do { try await Task.sleep(for: .seconds(30)) }
@@ -98,53 +217,118 @@ actor BridgeCloudMailboxConsumer {
                 )
             }
         }
-        let outcome = await deliver(command)
+        let outcome = await operationBlock()
         renewal.cancel()
-
         switch outcome {
         case .completed(let message):
             try await publishReceipt(
-                CommandReceipt(commandID: command.id, state: .sent, message: message)
+                CommandReceipt(commandID: commandID, state: .sent, message: message)
             )
-            try await transport.acknowledge(
-                recordID: claim.recordID,
-                leaseToken: claim.leaseToken
-            )
+            try await acknowledge(claim)
         case .queued(let message):
-            try await outbox.recordQueued(pairingID: pairingID, commandID: command.id)
+            if operation == "text-write" {
+                try await outbox.recordQueued(pairingID: pairingID, commandID: commandID)
+            }
             try await publishReceipt(
-                CommandReceipt(commandID: command.id, state: .queued, message: message)
+                CommandReceipt(commandID: commandID, state: .queued, message: message)
             )
-            try await transport.acknowledge(
-                recordID: claim.recordID,
-                leaseToken: claim.leaseToken
-            )
+            try await acknowledge(claim)
         case .rejected(let message):
             try await publishReceipt(
-                CommandReceipt(commandID: command.id, state: .failed, message: message)
+                CommandReceipt(commandID: commandID, state: .failed, message: message)
             )
-            try await transport.acknowledge(
-                recordID: claim.recordID,
-                leaseToken: claim.leaseToken
-            )
+            try await acknowledge(claim)
         case .reconciliationRequired(let message):
             try await publishReceipt(
-                CommandReceipt(commandID: command.id, state: .failed, message: message)
+                CommandReceipt(commandID: commandID, state: .failed, message: message)
             )
-            try await transport.acknowledge(
-                recordID: claim.recordID,
-                leaseToken: claim.leaseToken
-            )
+            try await acknowledge(claim)
         case .retryableFailure:
             Self.logger.error(
-                "correlation=\(correlationID, privacy: .public) command=\(command.id.uuidString, privacy: .public) operation=text-write origin=watch-https result=lease-expiry-retry"
+                "correlation=\(correlationID, privacy: .public) command=\(commandID.uuidString, privacy: .public) operation=\(operation, privacy: .public) origin=watch-https result=lease-expiry-retry"
             )
             return false
         }
         Self.logger.notice(
-            "correlation=\(correlationID, privacy: .public) command=\(command.id.uuidString, privacy: .public) operation=text-write origin=watch-https result=transport-acked"
+            "correlation=\(correlationID, privacy: .public) command=\(commandID.uuidString, privacy: .public) operation=\(operation, privacy: .public) origin=watch-https result=transport-acked"
         )
         return true
+    }
+
+    func reconcileVoiceInbox() async throws {
+        for completed in try await voiceInbox.completedEntries() {
+            try await processVoice(completed)
+        }
+    }
+
+    private func processVoice(_ completed: CloudVoiceInbox.Completed) async throws {
+        let outcome = await deliverVoice(completed.command, completed.audio)
+        switch outcome {
+        case .completed(let message):
+            try await publishReceipt(.init(
+                commandID: completed.command.id, state: .sent, message: message
+            ))
+        case .queued(let message):
+            try await outbox.recordQueued(
+                pairingID: pairingID,
+                commandID: completed.command.id
+            )
+            try await publishReceipt(.init(
+                commandID: completed.command.id, state: .queued, message: message
+            ))
+        case .rejected(let message), .reconciliationRequired(let message):
+            try await publishReceipt(.init(
+                commandID: completed.command.id, state: .failed, message: message
+            ))
+        case .retryableFailure:
+            return
+        }
+        try await voiceInbox.remove(commandID: completed.command.id)
+    }
+
+    private func publishReadFailure(
+        requestID: UUID,
+        kind: CloudReadFailure.Kind,
+        taskID: String?,
+        message: String
+    ) async throws {
+        try await publish(
+            commandID: requestID,
+            operation: .readFailure,
+            body: CloudReadFailure(
+                requestID: requestID,
+                kind: kind,
+                taskID: taskID,
+                message: message
+            )
+        )
+    }
+
+    private func publish<T: Encodable>(
+        commandID: UUID,
+        operation: CloudRelayProtocol.Operation,
+        body: T
+    ) async throws {
+        let payload = try CloudRelayProtocol.SealedPayload(
+            commandID: commandID,
+            operation: operation,
+            body: body
+        )
+        let digest = payload.bodySHA256.prefix(6).map { String(format: "%02x", $0) }.joined()
+        try await transport.put(CloudRelayProtocol.seal(
+            payload: payload,
+            pairingID: pairingID,
+            direction: .macToWatch,
+            key: key,
+            recordDiscriminator: "\(operation.rawValue)-\(digest)"
+        ))
+    }
+
+    private func acknowledge(_ claim: BlindMailboxHTTPClient.ClaimedEnvelope) async throws {
+        try await transport.acknowledge(
+            recordID: claim.recordID,
+            leaseToken: claim.leaseToken
+        )
     }
 
     /// Rebuilds receipt delivery after Bridge restart. The journal stores no

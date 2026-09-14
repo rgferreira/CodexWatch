@@ -20,6 +20,10 @@ xcrun swiftc Shared/CodexModels.swift Shared/CloudRelayProtocol.swift \
   Tests/CloudRelayProtocolValidation.swift -o "$validation_dir/protocol"
 "$validation_dir/protocol"
 
+xcrun swiftc Shared/CodexModels.swift Tests/PendingTextCommandOutboxValidation.swift \
+  -o "$validation_dir/pending-command-outbox"
+"$validation_dir/pending-command-outbox"
+
 xcrun swiftc Shared/CodexModels.swift Shared/CloudRelayProtocol.swift \
   Shared/BlindMailboxState.swift Tests/BlindMailboxConcurrencyValidation.swift \
   -o "$validation_dir/concurrency"
@@ -31,7 +35,7 @@ xcrun swiftc Shared/CodexModels.swift Bridge/CloudRelayOutbox.swift \
 
 xcrun swiftc Shared/CodexModels.swift Shared/CloudRelayProtocol.swift \
   Shared/BlindMailboxHTTPClient.swift Bridge/CloudRelayOutbox.swift \
-  Bridge/BridgeCloudMailboxConsumer.swift \
+  Bridge/CloudVoiceInbox.swift Bridge/BridgeCloudMailboxConsumer.swift \
   Tests/BridgeCloudMailboxConsumerValidation.swift -o "$validation_dir/consumer"
 "$validation_dir/consumer"
 

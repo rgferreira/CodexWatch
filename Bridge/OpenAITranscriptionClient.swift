@@ -6,6 +6,7 @@ actor OpenAITranscriptionClient {
         case invalidResponse
         case rejected(String)
         case emptyTranscript
+        case timedOut
 
         var errorDescription: String? {
             switch self {
@@ -17,6 +18,8 @@ actor OpenAITranscriptionClient {
                 "OpenAI rechazó la transcripción: \(message)"
             case .emptyTranscript:
                 "OpenAI no detectó ninguna orden en la nota de voz."
+            case .timedOut:
+                "La transcripción superó 90 segundos y se canceló."
             }
         }
     }
@@ -71,7 +74,23 @@ actor OpenAITranscriptionClient {
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         request.httpBody = body
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 45
+        configuration.timeoutIntervalForResource = 90
+        configuration.waitsForConnectivity = false
+        let session = URLSession(configuration: configuration)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+            session.finishTasksAndInvalidate()
+        } catch let error as URLError where error.code == .timedOut {
+            session.invalidateAndCancel()
+            throw TranscriptionError.timedOut
+        } catch {
+            session.invalidateAndCancel()
+            throw error
+        }
         guard let http = response as? HTTPURLResponse else {
             throw TranscriptionError.invalidResponse
         }

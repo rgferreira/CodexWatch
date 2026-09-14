@@ -112,7 +112,7 @@ test-only and is never exposed outside loopback.
 1. Disable the build-29 HTTPS pairing and reinstall build 28.
 2. Continue through the iPhone/Bridge route.
 3. If a binary rollback is needed, install the archived artifacts from
-   `~/Library/Application Support/CodexWatch/RestorePoints/0.6-build-28-5fd8d18/`
+   `~/Library/Application Support/CodexWatch/RestorePoints.noindex/0.6-build-28-5fd8d18/`
    or build tag `codexwatch-v0.6-build28-stable`.
 
 No migration deletes iPhone settings, Bridge tokens, Codex tasks or Relay state.

@@ -19,12 +19,25 @@ enum CloudRelayProtocol {
 
     enum Operation: String, Codable, Sendable {
         case textCommand
+        case newTaskCommand
         case commandReceipt
         case heartbeat
+        case heartbeatAck
+        case taskListRequest
+        case taskListResponse
+        case conversationRequest
+        case conversationResponse
+        case readFailure
+        case voiceChunk
     }
 
     struct Heartbeat: Codable, Hashable, Sendable {
         let sentAt: Date
+    }
+
+    struct HeartbeatAck: Codable, Hashable, Sendable {
+        let requestID: UUID
+        let receivedAt: Date
     }
 
     enum ProtocolError: LocalizedError, Equatable {

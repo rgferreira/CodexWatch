@@ -501,16 +501,28 @@ final class BridgeController: ObservableObject {
               !request.body.isEmpty else {
             return .badRequest
         }
-        if let existing = commandReceipts[voiceCommand.id] { return .encodable(existing) }
+        let receipt = await processVoiceCommand(
+            voiceCommand,
+            audio: request.body,
+            correlationID: correlationID(for: request),
+            origin: origin(for: request)
+        )
+        return .encodable(receipt)
+    }
 
-        let correlationID = correlationID(for: request)
-        let origin = origin(for: request)
+    private func processVoiceCommand(
+        _ voiceCommand: CodexVoiceCommand,
+        audio: Data,
+        correlationID: String,
+        origin: String
+    ) async -> CommandReceipt {
+        if let existing = commandReceipts[voiceCommand.id] { return existing }
         switch operationSafety.beginWrite(commandID: voiceCommand.id, threadID: voiceCommand.taskID) {
-        case .duplicate(let receipt): return .encodable(receipt)
+        case .duplicate(let receipt): return receipt
         case .threadBusy:
-            return .encodable(CommandReceipt(commandID: voiceCommand.id, state: .failed, message: "Otra orden ya está en curso para esta tarea"))
+            return CommandReceipt(commandID: voiceCommand.id, state: .failed, message: "Otra orden ya está en curso para esta tarea")
         case .circuitOpen:
-            return .encodable(CommandReceipt(commandID: voiceCommand.id, state: .failed, message: "Reintentos detenidos temporalmente para proteger la tarea"))
+            return CommandReceipt(commandID: voiceCommand.id, state: .failed, message: "Reintentos detenidos temporalmente para proteger la tarea")
         case .started:
             telemetry(correlationID, threadID: voiceCommand.taskID, operation: "voice-write", origin: origin, result: "start")
         }
@@ -522,7 +534,7 @@ final class BridgeController: ObservableObject {
         defer { try? FileManager.default.removeItem(at: audioURL) }
 
         do {
-            try request.body.write(to: audioURL, options: .atomic)
+            try audio.write(to: audioURL, options: .atomic)
             guard let apiKey = try SecureTokenStore.load(
                 service: Self.openAIKeyService,
                 account: Self.openAIKeyAccount
@@ -539,7 +551,7 @@ final class BridgeController: ObservableObject {
                 operation: "voice-write",
                 started: started
             )
-            return .encodable(receipt)
+            return receipt
         } catch {
             Self.logger.error("No se pudo procesar una nota de voz: \(error.localizedDescription, privacy: .private)")
             let receipt = CommandReceipt(
@@ -550,7 +562,7 @@ final class BridgeController: ObservableObject {
             operationSafety.finishWrite(threadID: voiceCommand.taskID, receipt: receipt)
             remember(receipt)
             telemetry(correlationID, threadID: voiceCommand.taskID, operation: "voice-write", origin: origin, result: telemetryResult(for: error), duration: Date().timeIntervalSince(started))
-            return .encodable(receipt)
+            return receipt
         }
     }
 
@@ -826,6 +838,22 @@ final class BridgeController: ObservableObject {
                     guard let self else { return .retryableFailure }
                     return await self.deliverCloudCommand(command)
                 },
+                createTask: { [weak self] command in
+                    guard let self else { return .retryableFailure }
+                    return await self.deliverCloudNewTask(command)
+                },
+                listTasks: { [weak self] in
+                    guard let self else { throw CancellationError() }
+                    return try await self.cloudTasksSnapshot()
+                },
+                readConversation: { [weak self] taskID in
+                    guard let self else { throw CancellationError() }
+                    return try await self.appServer.recentMessages(threadID: taskID)
+                },
+                deliverVoice: { [weak self] command, audio in
+                    guard let self else { return .retryableFailure }
+                    return await self.deliverCloudVoice(command, audio: audio)
+                },
                 operationStatus: { [weak self] commandID in
                     guard let self else { throw CancellationError() }
                     return try await self.appServer.operationStatus(for: commandID)
@@ -841,6 +869,7 @@ final class BridgeController: ObservableObject {
                 while !Task.isCancelled {
                     do {
                         try await consumer.reconcileOutbox()
+                        try await consumer.reconcileVoiceInbox()
                         _ = try await consumer.drainOnce(waitSeconds: 20)
                         delay = 2
                     } catch is CancellationError {
@@ -916,6 +945,84 @@ final class BridgeController: ObservableObject {
             operationSafety.finishWrite(threadID: command.taskID, receipt: receipt)
             remember(receipt)
             return retryable ? .retryableFailure : .rejected(text)
+        }
+    }
+
+    private func cloudTasksSnapshot() async throws -> [CodexTask] {
+        let snapshot = try await appServer.listTasks()
+        tasks = snapshot
+        isCodexReady = true
+        updateReadiness()
+        return snapshot
+    }
+
+    private func deliverCloudNewTask(
+        _ command: NewTaskCommand
+    ) async -> BridgeCloudMailboxConsumer.DeliveryOutcome {
+        if let existing = commandReceipts[command.id] {
+            switch existing.state {
+            case .sent: return .completed(existing.message)
+            case .queued: return .queued(existing.message)
+            case .failed: return .rejected(existing.message)
+            }
+        }
+        let thread = "new-task"
+        switch operationSafety.beginWrite(commandID: command.id, threadID: thread) {
+        case .duplicate(let receipt):
+            return receipt.state == .sent
+                ? .completed(receipt.message)
+                : .rejected(receipt.message)
+        case .threadBusy, .circuitOpen:
+            return .retryableFailure
+        case .started:
+            break
+        }
+        do {
+            if let projectPath = command.projectPath,
+               !projectPath.isEmpty,
+               !tasks.contains(where: { $0.projectPath == projectPath }) {
+                throw NSError(
+                    domain: "CodexWatch",
+                    code: 4,
+                    userInfo: [NSLocalizedDescriptionKey: "El proyecto seleccionado ya no está disponible"]
+                )
+            }
+            _ = try await appServer.createTask(command)
+            let receipt = CommandReceipt(
+                commandID: command.id,
+                state: .sent,
+                message: "Tarea creada"
+            )
+            operationSafety.finishWrite(threadID: thread, receipt: receipt)
+            remember(receipt)
+            _ = try? await cloudTasksSnapshot()
+            return .completed(receipt.message)
+        } catch {
+            let receipt = CommandReceipt(
+                commandID: command.id,
+                state: .failed,
+                message: error.localizedDescription
+            )
+            operationSafety.finishWrite(threadID: thread, receipt: receipt)
+            remember(receipt)
+            return .rejected(receipt.message)
+        }
+    }
+
+    private func deliverCloudVoice(
+        _ command: CodexVoiceCommand,
+        audio: Data
+    ) async -> BridgeCloudMailboxConsumer.DeliveryOutcome {
+        let receipt = await processVoiceCommand(
+            command,
+            audio: audio,
+            correlationID: "mailbox-\(command.id.uuidString.lowercased())",
+            origin: "watch-https"
+        )
+        switch receipt.state {
+        case .sent: return .completed(receipt.message)
+        case .queued: return .queued(receipt.message)
+        case .failed: return .rejected(receipt.message)
         }
     }
 

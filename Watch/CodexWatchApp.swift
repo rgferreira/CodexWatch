@@ -219,11 +219,15 @@ struct TaskPickerView: View {
     NavigationStack {
       Group {
         if relay.tasks.isEmpty {
-          ContentUnavailableView(
-            "Sin tareas", systemImage: "iphone.and.arrow.forward",
-            description: Text(relay.taskRefreshError ?? "Actualizando desde Codex…"))
+          VStack(spacing: 8) {
+            CloudTransportStatusView()
+            ContentUnavailableView(
+              "Sin tareas", systemImage: "tray",
+              description: Text(relay.taskRefreshError ?? "Actualizando desde Codex…"))
+          }
         } else {
           List {
+            CloudTransportStatusView()
             if let error = relay.taskRefreshError {
               Label(error, systemImage: "exclamationmark.triangle")
                 .font(.caption2)
@@ -286,6 +290,21 @@ struct TaskPickerView: View {
     } message: {
       Text("Comprueba en el Mac el código \(relay.pendingCloudPairingCode ?? "").")
     }
+  }
+}
+
+private struct CloudTransportStatusView: View {
+  @EnvironmentObject private var relay: WatchRelay
+
+  var body: some View {
+    Label(
+      relay.cloudTransportStatus,
+      systemImage: relay.isCloudTransportActive ? "cloud.fill" : "cloud.slash.fill"
+    )
+    .font(.caption2)
+    .foregroundStyle(relay.isCloudTransportActive ? .green : .orange)
+    .lineLimit(2)
+    .accessibilityLabel("Conexión directa: \(relay.cloudTransportStatus)")
   }
 }
 
@@ -503,6 +522,7 @@ struct VoiceCommandView: View {
   @State private var commandID: UUID?
   @State private var transcript = ""
   @State private var hasPositionedInitialMessages = false
+  @State private var confirmsDuplicateCommand = false
 
   private var recentMessages: [CodexMessage] {
     relay.conversations[task.id] ?? []
@@ -555,6 +575,9 @@ struct VoiceCommandView: View {
         }
       }
       .onAppear {
+        if commandID == nil, let pending = relay.latestPendingTextCommand(taskID: task.id) {
+          commandID = pending.command.id
+        }
         if !recentMessages.isEmpty {
           hasPositionedInitialMessages = true
           proxy.scrollTo(ScrollAnchor.composer, anchor: .bottom)
@@ -603,11 +626,23 @@ struct VoiceCommandView: View {
         dismiss()
       }
     }
+    .alert("Ya hay una orden idéntica pendiente", isPresented: $confirmsDuplicateCommand) {
+      Button("Enviar otra de todos modos") {
+        commandID = relay.send(
+          CodexCommand(task: task, text: transcript),
+          allowingDuplicate: true
+        )
+        WKInterfaceDevice.current().play(.click)
+      }
+      Button("Cancelar", role: .cancel) {}
+    } message: {
+      Text("La orden anterior todavía no ha terminado. Solo se creará otra si lo confirmas.")
+    }
   }
 
   @ViewBuilder
   private var voiceComposer: some View {
-    if relay.voiceInputMode == .watchDictation {
+    if relay.shouldUseWatchDictation {
       watchDictationComposer
     } else {
       openAIComposer
@@ -633,12 +668,19 @@ struct VoiceCommandView: View {
         .padding(8)
         .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
 
-      Button(relay.isDemoMode ? "Send" : "Enviar") {
-        commandID = relay.send(CodexCommand(task: task, text: transcript))
-        WKInterfaceDevice.current().play(.click)
+      if relay.pendingTextCommand(taskID: task.id, text: transcript) != nil {
+        Button(relay.isDemoMode ? "Send another" : "Enviar otra orden") {
+          confirmsDuplicateCommand = true
+        }
+        .tint(.orange)
+      } else {
+        Button(relay.isDemoMode ? "Send" : "Enviar") {
+          commandID = relay.send(CodexCommand(task: task, text: transcript))
+          WKInterfaceDevice.current().play(.click)
+        }
+        .tint(.green)
+        .disabled(receipt?.state == .queued)
       }
-      .tint(.green)
-      .disabled(receipt?.state == .queued)
     }
 
     if let receipt {
@@ -836,6 +878,8 @@ final class WatchRelay: NSObject, ObservableObject {
   @Published private(set) var transcriptionModel: OpenAITranscriptionModel = .gptTranscribe
   @Published private(set) var pendingCloudPairingCode: String?
   @Published private(set) var cloudTransportStatus = "Sin conexión directa"
+  @Published private(set) var isCloudTransportActive = false
+  @Published private(set) var companionReachable = false
 
   private let session: WCSession? = WCSession.isSupported() ? .default : nil
   let isDemoMode = ProcessInfo.processInfo.arguments.contains("--codexwatch-demo")
@@ -845,8 +889,17 @@ final class WatchRelay: NSObject, ObservableObject {
   private var pendingCloudPairingOffer: CloudRelayPairingOffer?
   private var cloudClient: WatchCloudRelayClient?
   private var cloudReceiveTask: Task<Void, Never>?
+  private var pendingTaskRequestID: UUID?
+  private var pendingConversationRequests: [UUID: (taskID: String, revision: Date)] = [:]
   private var pairingRequestInFlight = false
+  private var lastCloudRoundTripAt: Date?
   private static let cachedConversationsKey = "cachedConversations"
+  private static let pendingTextCommandOutboxKey = "pendingTextCommandOutbox"
+  private var pendingTextCommandOutbox = PendingTextCommandOutbox()
+
+  var shouldUseWatchDictation: Bool {
+    voiceInputMode == .watchDictation
+  }
 
   private override init() {
     super.init()
@@ -854,11 +907,20 @@ final class WatchRelay: NSObject, ObservableObject {
       prepareDemo()
       return
     }
-    guard let data = UserDefaults.standard.data(forKey: Self.cachedConversationsKey),
+    if let data = UserDefaults.standard.data(forKey: Self.pendingTextCommandOutboxKey),
+      let outbox = try? CodexWatchWire.decode(PendingTextCommandOutbox.self, from: data)
+    {
+      pendingTextCommandOutbox = outbox
+      commandReceipts = Dictionary(
+        uniqueKeysWithValues: outbox.intents.map { ($0.command.id, $0.receipt) }
+      )
+    }
+    if let data = UserDefaults.standard.data(forKey: Self.cachedConversationsKey),
       let cached = try? CodexWatchWire.decode([String: CachedConversation].self, from: data)
-    else { return }
-    conversations = cached.mapValues(\.messages)
-    conversationRevisions = cached.mapValues(\.updatedAt)
+    {
+      conversations = cached.mapValues(\.messages)
+      conversationRevisions = cached.mapValues(\.updatedAt)
+    }
   }
 
   func start() {
@@ -866,6 +928,7 @@ final class WatchRelay: NSObject, ObservableObject {
     guard session?.delegate == nil else { return }
     session?.delegate = self
     session?.activate()
+    companionReachable = session?.isReachable == true
     configureExistingCloudTransport()
     if let data = session?.receivedApplicationContext[CodexWatchWire.tasks] as? Data {
       applyTasks(
@@ -879,12 +942,22 @@ final class WatchRelay: NSObject, ObservableObject {
     )
   }
 
-  func send(_ command: CodexCommand) -> UUID {
-    commandReceipts[command.id] = CommandReceipt(
+  func send(_ command: CodexCommand, allowingDuplicate: Bool = false) -> UUID {
+    if !allowingDuplicate,
+      let existing = pendingTextCommandOutbox.matching(
+        taskID: command.taskID,
+        text: command.text
+      )
+    {
+      commandReceipts[existing.command.id] = existing.receipt
+      return existing.command.id
+    }
+    let initialReceipt = CommandReceipt(
       commandID: command.id,
       state: .queued,
       message: isDemoMode ? "Sending to Codex…" : "Enviando al Mac…"
     )
+    setCommandReceipt(initialReceipt, for: command)
     if isDemoMode {
       Task { [weak self] in
         try? await Task.sleep(for: .milliseconds(850))
@@ -895,20 +968,20 @@ final class WatchRelay: NSObject, ObservableObject {
           text: command.text,
           createdAt: Date()
         ))
-        commandReceipts[command.id] = CommandReceipt(
+        setCommandReceipt(CommandReceipt(
           commandID: command.id,
           state: .sent,
           message: "Command sent to Codex"
-        )
+        ))
       }
       return command.id
     }
     guard let data = try? CodexWatchWire.encode(command) else {
-      commandReceipts[command.id] = CommandReceipt(
+      setCommandReceipt(CommandReceipt(
         commandID: command.id,
         state: .failed,
         message: "No se pudo preparar la orden"
-      )
+      ))
       return command.id
     }
     if let cloudClient {
@@ -916,14 +989,22 @@ final class WatchRelay: NSObject, ObservableObject {
         do {
           try await cloudClient.send(command)
           guard let self else { return }
-          commandReceipts[command.id] = CommandReceipt(
+          setCommandReceipt(CommandReceipt(
             commandID: command.id,
             state: .queued,
             message: "Enviada directamente por HTTPS…"
-          )
+          ))
           cloudTransportStatus = "Conexión directa activa"
         } catch {
-          self?.sendThroughCompanion(commandID: command.id, data: data)
+          guard let self else { return }
+          isCloudTransportActive = false
+          cloudTransportStatus = "HTTPS directo falló · usando iPhone"
+          setCommandReceipt(CommandReceipt(
+            commandID: command.id,
+            state: .queued,
+            message: "HTTPS directo falló; probando con el iPhone…"
+          ))
+          sendThroughCompanion(commandID: command.id, data: data)
         }
       }
       return command.id
@@ -934,11 +1015,11 @@ final class WatchRelay: NSObject, ObservableObject {
 
   private func sendThroughCompanion(commandID: UUID, data: Data) {
     guard let session, session.activationState == .activated else {
-      commandReceipts[commandID] = CommandReceipt(
+      setCommandReceipt(CommandReceipt(
         commandID: commandID,
         state: .failed,
         message: "El Watch no está conectado con el iPhone"
-      )
+      ))
       return
     }
     if session.isReachable {
@@ -954,11 +1035,11 @@ final class WatchRelay: NSObject, ObservableObject {
       )
     } else {
       session.transferUserInfo([CodexWatchWire.command: data])
-      commandReceipts[commandID] = CommandReceipt(
+      setCommandReceipt(CommandReceipt(
         commandID: commandID,
         state: .queued,
         message: "Pendiente de que responda el iPhone…"
-      )
+      ))
     }
   }
 
@@ -996,19 +1077,48 @@ final class WatchRelay: NSObject, ObservableObject {
       }
       return command.id
     }
-    guard let data = try? CodexWatchWire.encode(command),
-          let session,
-          session.activationState == .activated else {
+    guard let data = try? CodexWatchWire.encode(command) else {
       commandReceipts[command.id] = CommandReceipt(
         commandID: command.id,
         state: .failed,
-        message: "El Watch no está conectado con el iPhone"
+        message: "No se pudo preparar la nueva tarea"
       )
       return command.id
     }
+    if let cloudClient {
+      Task { [weak self] in
+        do {
+          try await cloudClient.createTask(command)
+          self?.commandReceipts[command.id] = CommandReceipt(
+            commandID: command.id,
+            state: .queued,
+            message: "Creando directamente por HTTPS…"
+          )
+        } catch {
+          guard let self else { return }
+          isCloudTransportActive = false
+          cloudTransportStatus = "HTTPS directo falló · usando iPhone"
+          sendNewTaskThroughCompanion(commandID: command.id, data: data)
+        }
+      }
+      return command.id
+    }
+    sendNewTaskThroughCompanion(commandID: command.id, data: data)
+    return command.id
+  }
+
+  private func sendNewTaskThroughCompanion(commandID: UUID, data: Data) {
+    guard let session, session.activationState == .activated else {
+      commandReceipts[commandID] = CommandReceipt(
+        commandID: commandID,
+        state: .failed,
+        message: "Sin conexión HTTPS directa ni iPhone"
+      )
+      return
+    }
     if session.isReachable {
       let replyHandler = WatchCommandReplyHandler(
-        commandID: command.id,
+        commandID: commandID,
         commandData: data,
         messageKey: CodexWatchWire.newTaskCommand,
         session: session
@@ -1020,20 +1130,15 @@ final class WatchRelay: NSObject, ObservableObject {
       )
     } else {
       session.transferUserInfo([CodexWatchWire.newTaskCommand: data])
-      commandReceipts[command.id] = CommandReceipt(
-        commandID: command.id,
+      commandReceipts[commandID] = CommandReceipt(
+        commandID: commandID,
         state: .queued,
         message: "Pendiente de que responda el iPhone…"
       )
     }
-    return command.id
   }
 
   func sendVoice(task: CodexTask, fileURL: URL) -> UUID? {
-    guard let session, session.activationState == .activated else {
-      try? FileManager.default.removeItem(at: fileURL)
-      return nil
-    }
     let command = CodexVoiceCommand(task: task, transcriptionModel: transcriptionModel)
     guard let metadata = try? CodexWatchWire.encode(command) else {
       try? FileManager.default.removeItem(at: fileURL)
@@ -1042,10 +1147,59 @@ final class WatchRelay: NSObject, ObservableObject {
     commandReceipts[command.id] = CommandReceipt(
       commandID: command.id,
       state: .queued,
+      message: cloudClient == nil ? "Enviando audio al iPhone…" : "Enviando audio directamente…"
+    )
+    if let cloudClient {
+      Task { [weak self] in
+        do {
+          let audio = try Data(contentsOf: fileURL, options: [.mappedIfSafe])
+          try await cloudClient.sendVoice(command, audio: audio)
+          try? FileManager.default.removeItem(at: fileURL)
+          self?.commandReceipts[command.id] = CommandReceipt(
+            commandID: command.id,
+            state: .queued,
+            message: "Audio enviado directamente; transcribiendo…"
+          )
+        } catch {
+          guard let self else { return }
+          isCloudTransportActive = false
+          cloudTransportStatus = "Falló el audio HTTPS directo"
+          try? FileManager.default.removeItem(at: fileURL)
+          commandReceipts[command.id] = CommandReceipt(
+            commandID: command.id,
+            state: .failed,
+            message: "Audio HTTPS fallido: \(error.localizedDescription)"
+          )
+        }
+      }
+      return command.id
+    }
+    sendVoiceThroughCompanion(command: command, metadata: metadata, fileURL: fileURL)
+    return command.id
+  }
+
+  private func sendVoiceThroughCompanion(
+    command: CodexVoiceCommand,
+    metadata: Data,
+    fileURL: URL
+  ) {
+    guard let session,
+          session.activationState == .activated,
+          companionReachable else {
+      try? FileManager.default.removeItem(at: fileURL)
+      commandReceipts[command.id] = CommandReceipt(
+        commandID: command.id,
+        state: .failed,
+        message: "Sin conexión HTTPS directa ni iPhone"
+      )
+      return
+    }
+    commandReceipts[command.id] = CommandReceipt(
+      commandID: command.id,
+      state: .queued,
       message: "Enviando audio al iPhone…"
     )
     session.transferFile(fileURL, metadata: [CodexWatchWire.voiceCommand: metadata])
-    return command.id
   }
 
   func refreshReceipt(_ commandID: UUID) {
@@ -1070,6 +1224,42 @@ final class WatchRelay: NSObject, ObservableObject {
       }
       return
     }
+    if let cloudClient {
+      isRefreshingTasks = true
+      taskRefreshError = nil
+      let requestID = UUID()
+      pendingTaskRequestID = requestID
+      Task { [weak self] in
+        do {
+          try await cloudClient.requestTasks(requestID: requestID)
+          try await Task.sleep(for: .seconds(30))
+          guard let self, pendingTaskRequestID == requestID else { return }
+          pendingTaskRequestID = nil
+          isRefreshingTasks = false
+          if companionReachable {
+            cloudTransportStatus = "HTTPS sin respuesta · usando iPhone"
+            refreshTasksThroughCompanion()
+          } else {
+            taskRefreshError = "El Mac no respondió por HTTPS"
+          }
+        } catch {
+          guard let self, pendingTaskRequestID == requestID else { return }
+          pendingTaskRequestID = nil
+          isRefreshingTasks = false
+          if companionReachable {
+            cloudTransportStatus = "HTTPS directo falló · usando iPhone"
+            refreshTasksThroughCompanion()
+          } else {
+            taskRefreshError = "Sin conexión HTTPS directa ni iPhone"
+          }
+        }
+      }
+      return
+    }
+    refreshTasksThroughCompanion()
+  }
+
+  private func refreshTasksThroughCompanion() {
     guard let session, session.activationState == .activated else {
       taskRefreshError = "Conectando con el iPhone…"
       return
@@ -1113,6 +1303,52 @@ final class WatchRelay: NSObject, ObservableObject {
     if isDemoMode { return }
     if let loadedRevision = conversationRevisions[taskID], loadedRevision >= revision { return }
     guard !loadingConversations.contains(taskID) else { return }
+    if let cloudClient {
+      loadingConversations.insert(taskID)
+      conversationErrors[taskID] = nil
+      let requestID = UUID()
+      pendingConversationRequests[requestID] = (taskID, revision)
+      Task { [weak self] in
+        do {
+          try await cloudClient.requestConversation(
+            requestID: requestID,
+            taskID: taskID,
+            revision: revision
+          )
+          try await Task.sleep(for: .seconds(30))
+          guard let self,
+                let pending = pendingConversationRequests.removeValue(forKey: requestID) else { return }
+          loadingConversations.remove(pending.taskID)
+          if companionReachable {
+            cloudTransportStatus = "HTTPS sin respuesta · usando iPhone"
+            loadConversationThroughCompanion(
+              taskID: pending.taskID,
+              revision: pending.revision
+            )
+          } else {
+            conversationErrors[pending.taskID] = "El Mac no respondió por HTTPS"
+          }
+        } catch {
+          guard let self,
+                let pending = pendingConversationRequests.removeValue(forKey: requestID) else { return }
+          loadingConversations.remove(pending.taskID)
+          if companionReachable {
+            cloudTransportStatus = "HTTPS directo falló · usando iPhone"
+            loadConversationThroughCompanion(
+              taskID: pending.taskID,
+              revision: pending.revision
+            )
+          } else {
+            conversationErrors[pending.taskID] = "Sin conexión HTTPS directa ni iPhone"
+          }
+        }
+      }
+      return
+    }
+    loadConversationThroughCompanion(taskID: taskID, revision: revision)
+  }
+
+  private func loadConversationThroughCompanion(taskID: String, revision: Date) {
     guard let session, session.isReachable else {
       if conversations[taskID]?.isEmpty != false {
         conversationErrors[taskID] = "Abre Codex Watch en el iPhone"
@@ -1159,11 +1395,32 @@ final class WatchRelay: NSObject, ObservableObject {
 
   fileprivate func applyCommandReceipt(_ data: Data) {
     guard let receipt = try? CodexWatchWire.decode(CommandReceipt.self, from: data) else { return }
-    commandReceipts[receipt.commandID] = receipt
+    setCommandReceipt(receipt)
   }
 
   fileprivate func setCommandReceipt(_ receipt: CommandReceipt) {
     commandReceipts[receipt.commandID] = receipt
+    pendingTextCommandOutbox.apply(receipt)
+    persistPendingTextCommandOutbox()
+  }
+
+  private func setCommandReceipt(_ receipt: CommandReceipt, for command: CodexCommand) {
+    commandReceipts[receipt.commandID] = receipt
+    pendingTextCommandOutbox.record(command, receipt: receipt)
+    persistPendingTextCommandOutbox()
+  }
+
+  func latestPendingTextCommand(taskID: String) -> PendingTextCommandOutbox.Intent? {
+    pendingTextCommandOutbox.latest(taskID: taskID)
+  }
+
+  func pendingTextCommand(taskID: String, text: String) -> PendingTextCommandOutbox.Intent? {
+    pendingTextCommandOutbox.matching(taskID: taskID, text: text)
+  }
+
+  private func persistPendingTextCommandOutbox() {
+    guard let data = try? CodexWatchWire.encode(pendingTextCommandOutbox) else { return }
+    UserDefaults.standard.set(data, forKey: Self.pendingTextCommandOutboxKey)
   }
 
   fileprivate func failTaskRefresh(_ message: String) {
@@ -1339,28 +1596,44 @@ final class WatchRelay: NSObject, ObservableObject {
   }
 
   private func configureExistingCloudTransport() {
-    guard cloudClient == nil,
-          let pairingID = CloudRelayKeyStore.loadActivePairingID(role: "watch") else {
-      requestCloudPairingIfNeeded()
-      return
-    }
+    guard cloudClient == nil else { return }
     do {
-      guard let pairing = try CloudRelayKeyStore.loadPairing(
-        role: "watch",
-        pairingID: pairingID
-      ), let configuration = try CloudRelayKeyStore.loadTransport(
-        role: "watch",
-        pairingID: pairingID
-      ) else { throw BlindMailboxHTTPClient.ClientError.invalidConfiguration }
+      let material: (
+        pairing: CloudRelayProtocol.PairingMaterial,
+        transport: CloudRelayTransportConfiguration
+      )?
+      if let pairingID = CloudRelayKeyStore.loadActivePairingID(role: "watch"),
+         let pairing = try CloudRelayKeyStore.loadPairing(role: "watch", pairingID: pairingID),
+         pairing.isApproved,
+         let transport = try CloudRelayKeyStore.loadTransport(role: "watch", pairingID: pairingID),
+         transport.pairingID == pairingID {
+        material = (pairing, transport)
+      } else {
+        material = try CloudRelayKeyStore.recoverApprovedPairing(role: "watch")
+      }
+      guard let material else {
+        CloudRelayKeyStore.setActivePairingID(nil, role: "watch")
+        isCloudTransportActive = false
+        cloudTransportStatus = "Conexión directa sin emparejar"
+        pairingRequestInFlight = false
+        requestCloudPairingIfNeeded()
+        return
+      }
       let client = try WatchCloudRelayClient(
-        configuration: configuration,
-        pairing: pairing
+        configuration: material.transport,
+        pairing: material.pairing
       )
       cloudClient = client
+      isCloudTransportActive = false
       cloudTransportStatus = "Conexión directa preparada"
       startCloudReceiveLoop(client)
     } catch {
-      cloudTransportStatus = "El pairing guardado no es válido"
+      CloudRelayKeyStore.setActivePairingID(nil, role: "watch")
+      cloudClient = nil
+      isCloudTransportActive = false
+      cloudTransportStatus = "Conexión directa dañada · reemparejando"
+      pairingRequestInFlight = false
+      requestCloudPairingIfNeeded()
     }
   }
 
@@ -1368,22 +1641,73 @@ final class WatchRelay: NSObject, ObservableObject {
     cloudReceiveTask?.cancel()
     cloudReceiveTask = Task { [weak self] in
       var delay: UInt64 = 2
+      var lastHeartbeatSentAt = Date.distantPast
       while !Task.isCancelled {
         do {
-          try await client.sendHeartbeat()
-          let receipts = try await client.receiveOnce(waitSeconds: 20)
+          if Date().timeIntervalSince(lastHeartbeatSentAt) >= 45 {
+            _ = try await client.sendHeartbeat()
+            lastHeartbeatSentAt = Date()
+          }
+          let events = try await client.receiveOnce(waitSeconds: 20)
           guard let self else { return }
-          for receipt in receipts { commandReceipts[receipt.commandID] = receipt }
-          cloudTransportStatus = "Conexión directa activa"
+          for event in events { applyCloudEvent(event) }
+          if let lastCloudRoundTripAt,
+             Date().timeIntervalSince(lastCloudRoundTripAt) <= 90 {
+            isCloudTransportActive = true
+            cloudTransportStatus = "Conexión directa activa"
+          } else {
+            isCloudTransportActive = false
+            cloudTransportStatus = "Worker accesible · esperando al Mac"
+          }
           delay = 2
         } catch is CancellationError {
           return
         } catch {
+          self?.isCloudTransportActive = false
           self?.cloudTransportStatus = "HTTPS sin respuesta · reintentando"
           try? await Task.sleep(for: .seconds(delay))
           delay = min(delay * 2, 30)
         }
       }
+    }
+  }
+
+  private func applyCloudEvent(_ event: WatchCloudRelayClient.Event) {
+    switch event {
+    case .receipt(let receipt):
+      setCommandReceipt(receipt)
+    case .tasks(let response):
+      guard pendingTaskRequestID == response.requestID,
+            let data = try? CodexWatchWire.encode(response.tasks) else { return }
+      pendingTaskRequestID = nil
+      applyTasks(data, revision: response.revision.timeIntervalSince1970)
+    case .conversation(let response):
+      guard let pending = pendingConversationRequests.removeValue(
+        forKey: response.requestID
+      ), pending.taskID == response.conversation.taskID else { return }
+      finishConversation(
+        response.conversation,
+        for: pending.taskID,
+        revision: response.revision
+      )
+    case .readFailure(let failure):
+      switch failure.kind {
+      case .tasks where pendingTaskRequestID == failure.requestID:
+        pendingTaskRequestID = nil
+        isRefreshingTasks = false
+        taskRefreshError = failure.message
+      case .conversation:
+        guard let pending = pendingConversationRequests.removeValue(
+          forKey: failure.requestID
+        ) else { return }
+        failConversation(for: pending.taskID, message: failure.message)
+      default:
+        break
+      }
+    case .heartbeatAck:
+      lastCloudRoundTripAt = Date()
+      isCloudTransportActive = true
+      cloudTransportStatus = "Conexión directa activa"
     }
   }
 
@@ -1465,7 +1789,9 @@ extension WatchRelay: WCSessionDelegate {
     error: Error?
   ) {
     guard activationState == .activated, error == nil else { return }
+    let isReachable = session.isReachable
     Task { @MainActor [weak self] in
+      self?.companionReachable = isReachable
       self?.refreshTasks()
       self?.requestCloudPairingIfNeeded()
     }
@@ -1519,8 +1845,10 @@ extension WatchRelay: WCSessionDelegate {
   }
 
   nonisolated func sessionReachabilityDidChange(_ session: WCSession) {
-    guard session.isReachable else { return }
+    let isReachable = session.isReachable
     Task { @MainActor [weak self] in
+      self?.companionReachable = isReachable
+      guard isReachable else { return }
       self?.refreshTasks()
       self?.requestCloudPairingIfNeeded()
     }
