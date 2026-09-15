@@ -11,7 +11,7 @@ actor WatchCloudRelayClient {
         case heartbeatAck(CloudRelayProtocol.HeartbeatAck)
     }
 
-    private let transport: BlindMailboxHTTPClient
+    private let transport: any BlindMailboxTransport
     private let pairingID: String
     private let key: SymmetricKey
 
@@ -35,6 +35,16 @@ actor WatchCloudRelayClient {
             peerPublicKey: peerPublicKey,
             pairingID: configuration.pairingID
         )
+    }
+
+    init(
+        transport: any BlindMailboxTransport,
+        pairingID: String,
+        key: SymmetricKey
+    ) {
+        self.transport = transport
+        self.pairingID = pairingID
+        self.key = key
     }
 
     func send(_ command: CodexCommand) async throws {
@@ -181,13 +191,58 @@ actor WatchCloudRelayClient {
             default:
                 throw CloudRelayProtocol.ProtocolError.operationMismatch
             }
-            try await transport.acknowledge(
-                recordID: claim.recordID,
-                leaseToken: claim.leaseToken
-            )
             events.append(event)
+            // Delivery to the UI must not wait for transport cleanup. A real
+            // URLSession ACK can remain suspended until its network timeout;
+            // redelivery is safe because responses are idempotent.
+            let transport = self.transport
+            Task {
+                try? await Self.acknowledgeWithRetry(
+                    transport: transport,
+                    claim: claim
+                )
+            }
         }
         return events
+    }
+
+    private nonisolated static func acknowledgeWithRetry(
+        transport: any BlindMailboxTransport,
+        claim: BlindMailboxHTTPClient.ClaimedEnvelope
+    ) async throws {
+        var attempt = 0
+        while true {
+            do {
+                try await transport.acknowledge(
+                    recordID: claim.recordID,
+                    leaseToken: claim.leaseToken
+                )
+                return
+            } catch {
+                let delays = retryDelays(for: error)
+                guard attempt < delays.count else { throw error }
+                try await Task.sleep(for: delays[attempt])
+                attempt += 1
+            }
+        }
+    }
+
+    private nonisolated static func retryDelays(for error: Error) -> [Duration] {
+        if let value = error as? BlindMailboxHTTPClient.ClientError {
+            switch value {
+            case .rateLimited:
+                return [.seconds(2), .seconds(5), .seconds(10), .seconds(20)]
+            case .leaseLost, .unavailable:
+                return [.milliseconds(250), .seconds(1), .seconds(2)]
+            default:
+                return []
+            }
+        }
+        if let value = error as? URLError,
+           [.timedOut, .networkConnectionLost, .notConnectedToInternet].contains(value.code) {
+            return [.milliseconds(250), .seconds(1), .seconds(2)]
+        }
+        return []
     }
 
     private func put<T: Encodable>(

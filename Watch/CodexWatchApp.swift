@@ -579,6 +579,7 @@ struct VoiceCommandView: View {
         }
       }
       .onAppear {
+        relay.setConversationVisible(task.id, visible: true)
         if commandID == nil, let pending = relay.latestPendingTextCommand(taskID: task.id) {
           commandID = pending.command.id
         }
@@ -621,7 +622,10 @@ struct VoiceCommandView: View {
         }
       }
     }
-    .onDisappear { recorder.discard() }
+    .onDisappear {
+      recorder.discard()
+      relay.setConversationVisible(task.id, visible: false)
+    }
     .onChange(of: receipt?.state) { _, state in
       guard state == .sent else { return }
       WKInterfaceDevice.current().play(.success)
@@ -899,6 +903,7 @@ final class WatchRelay: NSObject, ObservableObject {
   private var pendingProjectRequestID: UUID?
   private var taskRefreshTimeoutTask: Task<Void, Never>?
   private var pendingConversationRequests: [UUID: (taskID: String, revision: Date)] = [:]
+  private var visibleConversationTaskIDs: Set<String> = []
   private var pairingRequestInFlight = false
   private var lastCloudRoundTripAt: Date?
   private static let cachedConversationsKey = "cachedConversations"
@@ -1330,16 +1335,19 @@ final class WatchRelay: NSObject, ObservableObject {
     refreshTasks()
     while !Task.isCancelled {
       do {
-        try await Task.sleep(for: .seconds(10))
+        try await Task.sleep(for: .seconds(30))
       } catch {
         return
       }
-      refreshTasks()
+      if visibleConversationTaskIDs.isEmpty {
+        refreshTasks()
+      }
     }
   }
 
   func refreshProjects() {
     guard !isDemoMode else { return }
+    guard pendingProjectRequestID == nil else { return }
     let requestID = UUID()
     if let cloudClient {
       startCloudReceiveLoop(cloudClient)
@@ -1347,7 +1355,7 @@ final class WatchRelay: NSObject, ObservableObject {
       Task { [weak self] in
         do {
           try await cloudClient.requestProjects(requestID: requestID)
-          try await Task.sleep(for: .seconds(15))
+          try await Task.sleep(for: .seconds(45))
           guard let self, pendingProjectRequestID == requestID else { return }
           pendingProjectRequestID = nil
           requestProjectsThroughCompanion()
@@ -1405,7 +1413,7 @@ final class WatchRelay: NSObject, ObservableObject {
             taskID: taskID,
             revision: revision
           )
-          try await Task.sleep(for: .seconds(15))
+          try await Task.sleep(for: .seconds(45))
           guard let self,
                 let pending = pendingConversationRequests.removeValue(forKey: requestID) else { return }
           loadingConversations.remove(pending.taskID)
@@ -1475,6 +1483,14 @@ final class WatchRelay: NSObject, ObservableObject {
   fileprivate func failConversation(for taskID: String, message: String) {
     loadingConversations.remove(taskID)
     conversationErrors[taskID] = message
+  }
+
+  func setConversationVisible(_ taskID: String, visible: Bool) {
+    if visible {
+      visibleConversationTaskIDs.insert(taskID)
+    } else {
+      visibleConversationTaskIDs.remove(taskID)
+    }
   }
 
   fileprivate func finishTaskRefresh(
@@ -1750,7 +1766,11 @@ final class WatchRelay: NSObject, ObservableObject {
       var consecutiveFailures = 0
       while !Task.isCancelled {
         do {
-          if Date().timeIntervalSince(lastHeartbeatSentAt) >= 45 {
+          let hasRecentRoundTrip = self?.lastCloudRoundTripAt.map {
+            Date().timeIntervalSince($0) < 45
+          } ?? false
+          if !hasRecentRoundTrip,
+             Date().timeIntervalSince(lastHeartbeatSentAt) >= 45 {
             _ = try await client.sendHeartbeat()
             lastHeartbeatSentAt = Date()
           }
@@ -1939,8 +1959,6 @@ extension WatchRelay: WCSessionDelegate {
     let isReachable = session.isReachable
     Task { @MainActor [weak self] in
       self?.companionReachable = isReachable
-      self?.refreshTasks()
-      self?.refreshProjects()
       self?.requestCloudPairingIfNeeded()
     }
   }
@@ -2003,8 +2021,6 @@ extension WatchRelay: WCSessionDelegate {
     Task { @MainActor [weak self] in
       self?.companionReachable = isReachable
       guard isReachable else { return }
-      self?.refreshTasks()
-      self?.refreshProjects()
       self?.requestCloudPairingIfNeeded()
     }
   }

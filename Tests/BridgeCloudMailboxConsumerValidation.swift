@@ -6,12 +6,28 @@ actor MockMailboxTransport: BlindMailboxTransport {
     private var published: [CloudRelayProtocol.SealedEnvelope] = []
     private var acknowledged: [String] = []
     private var renewals = 0
+    private var putFailuresRemaining = 0
+    private var acknowledgeFailuresRemaining = 0
+    private var putFailure = BlindMailboxHTTPClient.ClientError.unavailable(503)
+
+    func failNextPuts(
+        _ count: Int,
+        with error: BlindMailboxHTTPClient.ClientError = .unavailable(503)
+    ) {
+        putFailuresRemaining = count
+        putFailure = error
+    }
+    func failNextAcknowledgements(_ count: Int) { acknowledgeFailuresRemaining = count }
 
     func seed(_ claim: BlindMailboxHTTPClient.ClaimedEnvelope) {
         inbound.append(claim)
     }
 
     func put(_ envelope: CloudRelayProtocol.SealedEnvelope) async throws {
+        if putFailuresRemaining > 0 {
+            putFailuresRemaining -= 1
+            throw putFailure
+        }
         published.append(envelope)
     }
 
@@ -30,6 +46,10 @@ actor MockMailboxTransport: BlindMailboxTransport {
     }
 
     func acknowledge(recordID: String, leaseToken: String) async throws {
+        if acknowledgeFailuresRemaining > 0 {
+            acknowledgeFailuresRemaining -= 1
+            throw BlindMailboxHTTPClient.ClientError.leaseLost
+        }
         acknowledged.append(recordID)
     }
 
@@ -185,6 +205,8 @@ struct BridgeCloudMailboxConsumerValidation {
             leaseToken: "lease-tasks",
             leaseExpiresAt: Date().addingTimeInterval(90)
         ))
+        await transport.failNextPuts(2, with: .rateLimited)
+        await transport.failNextAcknowledgements(2)
         let drainedTasks = try await consumer.drainOnce(waitSeconds: 0)
         precondition(drainedTasks)
         let afterTasks = await transport.snapshot()

@@ -56,4 +56,10 @@ xcrun swiftc Shared/CodexModels.swift Shared/CloudRelayProtocol.swift \
   -o "$validation_dir/http"
 "$validation_dir/http" "http://127.0.0.1:$server_port" "$test_secret_base64"
 
+xcrun swiftc Shared/CodexModels.swift Shared/CloudRelayProtocol.swift \
+  Shared/CloudRelayPairing.swift \
+  Shared/BlindMailboxHTTPClient.swift Watch/WatchCloudRelayClient.swift \
+  Tests/WatchCloudRelayClientValidation.swift -o "$validation_dir/watch-client"
+"$validation_dir/watch-client"
+
 print "All independent Watch transport validations passed"

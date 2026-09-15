@@ -107,10 +107,7 @@ actor BridgeCloudMailboxConsumer {
                     receivedAt: Date()
                 )
             )
-            try await transport.acknowledge(
-                recordID: claim.recordID,
-                leaseToken: claim.leaseToken
-            )
+            try await acknowledge(claim)
             return true
         }
         switch payload.operation {
@@ -138,24 +135,12 @@ actor BridgeCloudMailboxConsumer {
             )
         case .taskListRequest:
             _ = try payload.decode(CloudTaskListRequest.self)
+            let tasks: [CodexTask]
             do {
-                let tasks = try await listTasks()
-                let revision = Date()
-                try await publish(
-                    commandID: payload.commandID,
-                    operation: .taskListResponse,
-                    body: CloudTaskListResponse(
-                        requestID: payload.commandID,
-                        tasks: tasks,
-                        revision: revision
-                    )
-                )
-                Self.audit(
-                    "codexwatch_mailbox_receive correlation=\(correlationID) operation=task-list result=success count=\(tasks.count)"
-                )
+                tasks = try await listTasks()
             } catch {
                 Self.audit(
-                    "codexwatch_mailbox_receive correlation=\(correlationID) operation=task-list result=failure error=\(String(describing: type(of: error)))"
+                    "codexwatch_mailbox_receive correlation=\(correlationID) operation=task-list stage=read result=failure error=\(error.localizedDescription)"
                 )
                 try await publishReadFailure(
                     requestID: payload.commandID,
@@ -163,13 +148,49 @@ actor BridgeCloudMailboxConsumer {
                     taskID: nil,
                     message: "El Mac no pudo actualizar las tareas"
                 )
+                try await acknowledge(claim)
+                return true
             }
+            do {
+                try await publish(
+                    commandID: payload.commandID,
+                    operation: .taskListResponse,
+                    body: CloudTaskListResponse(
+                        requestID: payload.commandID,
+                        tasks: tasks,
+                        revision: Date()
+                    )
+                )
+            } catch {
+                Self.audit(
+                    "codexwatch_mailbox_receive correlation=\(correlationID) operation=task-list stage=publish result=failure error=\(error.localizedDescription)"
+                )
+                throw error
+            }
+            Self.audit(
+                "codexwatch_mailbox_receive correlation=\(correlationID) operation=task-list result=success count=\(tasks.count)"
+            )
             try await acknowledge(claim)
             return true
         case .projectListRequest:
             _ = try payload.decode(CloudProjectListRequest.self)
+            let projects: [CodexProject]
             do {
-                let projects = try await listProjects()
+                projects = try await listProjects()
+            } catch {
+                Self.audit(
+                    "codexwatch_mailbox_receive correlation=\(correlationID) operation=project-list stage=read result=failure error=\(error.localizedDescription)"
+                )
+                try await publishReadFailure(
+                    requestID: payload.commandID,
+                    kind: .projects,
+                    taskID: nil,
+                    message: "El Mac no pudo actualizar los proyectos"
+                )
+                try await acknowledge(claim)
+                return true
+            }
+            do {
                 try await publish(
                     commandID: payload.commandID,
                     operation: .projectListResponse,
@@ -179,26 +200,36 @@ actor BridgeCloudMailboxConsumer {
                         revision: Date()
                     )
                 )
-                Self.audit(
-                    "codexwatch_mailbox_receive correlation=\(correlationID) operation=project-list result=success count=\(projects.count)"
-                )
             } catch {
                 Self.audit(
-                    "codexwatch_mailbox_receive correlation=\(correlationID) operation=project-list result=failure error=\(String(describing: type(of: error)))"
+                    "codexwatch_mailbox_receive correlation=\(correlationID) operation=project-list stage=publish result=failure error=\(error.localizedDescription)"
                 )
-                try await publishReadFailure(
-                    requestID: payload.commandID,
-                    kind: .projects,
-                    taskID: nil,
-                    message: "El Mac no pudo actualizar los proyectos"
-                )
+                throw error
             }
+            Self.audit(
+                "codexwatch_mailbox_receive correlation=\(correlationID) operation=project-list result=success count=\(projects.count)"
+            )
             try await acknowledge(claim)
             return true
         case .conversationRequest:
             let request = try payload.decode(CloudConversationRequest.self)
+            let messages: [CodexMessage]
             do {
-                let messages = try await readConversation(request.taskID)
+                messages = try await readConversation(request.taskID)
+            } catch {
+                Self.audit(
+                    "codexwatch_mailbox_receive correlation=\(correlationID) thread=\(request.taskID) operation=conversation-read stage=read result=failure error=\(error.localizedDescription)"
+                )
+                try await publishReadFailure(
+                    requestID: payload.commandID,
+                    kind: .conversation,
+                    taskID: request.taskID,
+                    message: "El Mac no pudo cargar la conversación"
+                )
+                try await acknowledge(claim)
+                return true
+            }
+            do {
                 try await publish(
                     commandID: payload.commandID,
                     operation: .conversationResponse,
@@ -208,20 +239,15 @@ actor BridgeCloudMailboxConsumer {
                         revision: request.revision
                     )
                 )
-                Self.audit(
-                    "codexwatch_mailbox_receive correlation=\(correlationID) thread=\(request.taskID) operation=conversation-read result=success count=\(messages.count)"
-                )
             } catch {
                 Self.audit(
-                    "codexwatch_mailbox_receive correlation=\(correlationID) thread=\(request.taskID) operation=conversation-read result=failure error=\(String(describing: type(of: error)))"
+                    "codexwatch_mailbox_receive correlation=\(correlationID) thread=\(request.taskID) operation=conversation-read stage=publish result=failure error=\(error.localizedDescription)"
                 )
-                try await publishReadFailure(
-                    requestID: payload.commandID,
-                    kind: .conversation,
-                    taskID: request.taskID,
-                    message: "El Mac no pudo cargar la conversación"
-                )
+                throw error
             }
+            Self.audit(
+                "codexwatch_mailbox_receive correlation=\(correlationID) thread=\(request.taskID) operation=conversation-read result=success count=\(messages.count)"
+            )
             try await acknowledge(claim)
             return true
         case .voiceChunk:
@@ -367,20 +393,70 @@ actor BridgeCloudMailboxConsumer {
             body: body
         )
         let digest = payload.bodySHA256.prefix(6).map { String(format: "%02x", $0) }.joined()
-        try await transport.put(CloudRelayProtocol.seal(
+        let envelope = try CloudRelayProtocol.seal(
             payload: payload,
             pairingID: pairingID,
             direction: .macToWatch,
             key: key,
             recordDiscriminator: "\(operation.rawValue)-\(digest)"
-        ))
+        )
+        try await retryTransport { [transport] in
+            try await transport.put(envelope)
+        }
     }
 
     private func acknowledge(_ claim: BlindMailboxHTTPClient.ClaimedEnvelope) async throws {
-        try await transport.acknowledge(
-            recordID: claim.recordID,
-            leaseToken: claim.leaseToken
-        )
+        do {
+            try await retryTransport { [transport] in
+                try await transport.acknowledge(
+                    recordID: claim.recordID,
+                    leaseToken: claim.leaseToken
+                )
+            }
+        } catch {
+            // The response is already published. Lease expiry causes a safe,
+            // idempotent redelivery and must not suppress that response.
+            Self.audit(
+                "codexwatch_mailbox_ack result=pending-redelivery error=\(error.localizedDescription)"
+            )
+        }
+    }
+
+    private func retryTransport(
+        _ operation: @escaping @Sendable () async throws -> Void
+    ) async throws {
+        var attempt = 0
+        while true {
+            do {
+                try await operation()
+                return
+            } catch {
+                let delays = Self.retryDelays(for: error)
+                guard attempt < delays.count else { throw error }
+                try await Task.sleep(for: delays[attempt])
+                attempt += 1
+            }
+        }
+    }
+
+    private static func retryDelays(for error: Error) -> [Duration] {
+        if let value = error as? BlindMailboxHTTPClient.ClientError {
+            switch value {
+            case .rateLimited:
+                return [.seconds(2), .seconds(5), .seconds(10), .seconds(20)]
+            case .leaseLost, .unavailable:
+                return [.milliseconds(250), .seconds(1), .seconds(2)]
+            default:
+                return []
+            }
+        }
+        if let value = error as? URLError {
+            if [.timedOut, .networkConnectionLost, .notConnectedToInternet]
+                .contains(value.code) {
+                return [.milliseconds(250), .seconds(1), .seconds(2)]
+            }
+        }
+        return []
     }
 
     /// Rebuilds receipt delivery after Bridge restart. The journal stores no
@@ -436,6 +512,8 @@ actor BridgeCloudMailboxConsumer {
             key: key,
             recordDiscriminator: "receipt-\(receipt.state.rawValue)"
         )
-        try await transport.put(envelope)
+        try await retryTransport { [transport] in
+            try await transport.put(envelope)
+        }
     }
 }
