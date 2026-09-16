@@ -15,6 +15,14 @@ protocol BlindMailboxTransport: Sendable {
 }
 
 final class BlindMailboxHTTPClient: BlindMailboxTransport, @unchecked Sendable {
+    // A claim can return four envelopes. Each stored envelope is already JSON
+    // containing base64 ciphertext (up to 70 KiB) and the claim response wraps
+    // those bytes in base64 once more. Four valid envelopes therefore exceed
+    // 320 KiB even though every individual envelope respects the service
+    // limit. Keep a bounded margin above the protocol maximum so a full batch
+    // cannot be rejected and redelivered forever.
+    private static let maximumClaimResponseBytes = 512 * 1_024
+
     struct Configuration: Codable, Hashable, Sendable {
         let baseURL: URL
         let pairingID: String
@@ -192,7 +200,9 @@ final class BlindMailboxHTTPClient: BlindMailboxTransport, @unchecked Sendable {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let (data, response) = try await session.data(for: request)
         try validate(response, accepted: [200])
-        guard data.count <= 320 * 1_024 else { throw ClientError.payloadTooLarge }
+        guard data.count <= Self.maximumClaimResponseBytes else {
+            throw ClientError.payloadTooLarge
+        }
         let decoded = try CodexWatchWire.decode(ClaimResponse.self, from: data)
         return try decoded.items.map { item in
             ClaimedEnvelope(

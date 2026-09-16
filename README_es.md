@@ -4,6 +4,16 @@
 
 Aplicación experimental para seleccionar una tarea reciente de Codex desde el Apple Watch, consultar sus últimos mensajes, grabar una orden de voz y enviarla al Codex que se ejecuta en el Mac.
 
+## Versión estable actual
+
+**Codex Watch v0.7.0 · build 41** es la primera versión estable del transporte
+independiente del Watch. Permite funcionar del Watch al Mac mediante HTTPS
+cifrado sin depender del iPhone, sincroniza tareas y proyectos, carga un
+historial acotado, crea tareas y envía órdenes de texto o voz; la ruta mediante
+iPhone/ZeroTier permanece como respaldo. La build 41 evita además que un lote
+completo del buzón deje el historial bloqueado indefinidamente. Consulta
+[CHANGELOG.md](CHANGELOG.md).
+
 ## Verlo en acción
 
 <p align="center"><img src="docs/assets/codexwatch-demo.gif" alt="Demostración de un minuto de Codex Watch" width="360"></p>

@@ -105,6 +105,56 @@ struct BlindMailboxHTTPClientValidation {
         )
         precondition(empty.isEmpty)
 
+        // Four individually valid near-limit envelopes exceed 320 KiB once
+        // the mailbox wraps their JSON bytes in base64 for a claim response.
+        // This used to make the Watch reject the whole batch forever, leaving
+        // conversation history spinning while the transport still looked
+        // healthy.
+        let largeText = String(repeating: "x", count: 36 * 1_024)
+        var largeEnvelopeNames: Set<String> = []
+        for index in 0..<4 {
+            let requestID = UUID()
+            let response = CloudConversationResponse(
+                requestID: requestID,
+                conversation: CodexConversation(
+                    taskID: "large-thread-\(index)",
+                    messages: [CodexMessage(
+                        id: "large-message-\(index)",
+                        role: .assistant,
+                        text: largeText,
+                        createdAt: Date()
+                    )]
+                ),
+                revision: Date()
+            )
+            let largeEnvelope = try CloudRelayProtocol.seal(
+                payload: try .init(
+                    commandID: requestID,
+                    operation: .conversationResponse,
+                    body: response
+                ),
+                pairingID: configuration.pairingID,
+                direction: .macToWatch,
+                key: key
+            )
+            try await client.put(largeEnvelope)
+            largeEnvelopeNames.insert(largeEnvelope.context.recordName)
+        }
+        let largeBatch = try await client.claim(
+            direction: .macToWatch,
+            waitSeconds: 0,
+            leaseSeconds: 10,
+            limit: 4
+        )
+        precondition(largeBatch.count == 4)
+        precondition(Set(largeBatch.map(\.recordID)) == largeEnvelopeNames)
+        for item in largeBatch {
+            try await client.acknowledge(
+                recordID: item.recordID,
+                leaseToken: item.leaseToken
+            )
+        }
+
         let fixedNonce = Data(repeating: 7, count: 16)
         let replayRequest = try client.authenticatedRequest(
             method: "POST",
