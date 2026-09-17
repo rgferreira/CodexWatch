@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.7.1 — build 42 (2026-09-18)
+
+- Replaces the split Personal Team identities with one coherent iPhone and
+  Apple Watch application pair signed by the same development team.
+- Gives the Companion and Watch app a new, stable bundle hierarchy so the
+  iPhone no longer reconciles the current Watch build against the obsolete
+  build 34 companion package and removes it overnight.
+- Builds and validates the Watch binary as embedded content of the matching
+  iPhone Companion, while retaining independent Watch operation.
+- Removes the periodic installation checker introduced as a temporary
+  mitigation; it did not address the packaging conflict.
+
 ## v0.7.0 — build 41 (2026-09-16)
 
 First stable release of the independent Apple Watch workflow.

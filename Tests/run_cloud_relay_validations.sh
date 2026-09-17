@@ -62,4 +62,6 @@ xcrun swiftc Shared/CodexModels.swift Shared/CloudRelayProtocol.swift \
   Tests/WatchCloudRelayClientValidation.swift -o "$validation_dir/watch-client"
 "$validation_dir/watch-client"
 
+Tests/run_packaging_validation.sh
+
 print "All independent Watch transport validations passed"
