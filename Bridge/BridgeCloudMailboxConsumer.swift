@@ -417,9 +417,19 @@ actor BridgeCloudMailboxConsumer {
             // The response is already published. Lease expiry causes a safe,
             // idempotent redelivery and must not suppress that response.
             Self.audit(
-                "codexwatch_mailbox_ack result=pending-redelivery error=\(error.localizedDescription)"
+                "codexwatch_mailbox_ack phase=ack record_prefix=\(claim.recordID.prefix(12)) result=pending-redelivery error=\(Self.safeErrorCode(error))"
             )
         }
+    }
+
+    private static func safeErrorCode(_ error: Error) -> String {
+        if let value = error as? BlindMailboxHTTPClient.ClientError {
+            return value.telemetryCode
+        }
+        if let value = error as? URLError {
+            return "url_\(value.code.rawValue)"
+        }
+        return String(describing: type(of: error))
     }
 
     private func retryTransport(

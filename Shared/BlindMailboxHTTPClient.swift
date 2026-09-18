@@ -81,6 +81,22 @@ final class BlindMailboxHTTPClient: BlindMailboxTransport, @unchecked Sendable {
             case .unavailable(let status): "Buzón HTTPS no disponible (HTTP \(status))"
             }
         }
+
+        /// Safe transport-only classification for telemetry. It never contains
+        /// envelope bytes, audio, transcripts or server response bodies.
+        var telemetryCode: String {
+            switch self {
+            case .invalidConfiguration: "invalid_configuration"
+            case .invalidResponse: "invalid_response"
+            case .authenticationRejected: "authentication_rejected"
+            case .idempotencyConflict: "idempotency_conflict"
+            case .expired: "expired"
+            case .payloadTooLarge: "payload_too_large"
+            case .rateLimited: "rate_limited"
+            case .leaseLost: "lease_lost"
+            case .unavailable(let status): "http_\(status)"
+            }
+        }
     }
 
     private struct ClaimRequest: Codable {
