@@ -875,6 +875,9 @@ private struct CachedConversation: Codable {
 @MainActor
 final class WatchRelay: NSObject, ObservableObject {
   static let shared = WatchRelay()
+  private static var isWatchOnlyBuild: Bool {
+    Bundle.main.object(forInfoDictionaryKey: "WKWatchOnly") as? Bool == true
+  }
   @Published private(set) var tasks: [CodexTask] = []
   @Published private(set) var projects: [CodexProject] = []
   @Published private(set) var conversations: [String: [CodexMessage]] = [:]
@@ -890,7 +893,8 @@ final class WatchRelay: NSObject, ObservableObject {
   @Published private(set) var isCloudTransportActive = false
   @Published private(set) var companionReachable = false
 
-  private let session: WCSession? = WCSession.isSupported() ? .default : nil
+  private let session: WCSession? =
+    !WatchRelay.isWatchOnlyBuild && WCSession.isSupported() ? .default : nil
   let isDemoMode = ProcessInfo.processInfo.arguments.contains("--codexwatch-demo")
   private var lastQueuedTaskRequest: Date?
   private var latestTasksRevision = UserDefaults.standard.double(forKey: "latestTasksRevision")
@@ -1020,6 +1024,15 @@ final class WatchRelay: NSObject, ObservableObject {
           cloudTransportStatus = "Conexión directa activa"
         } catch {
           guard let self else { return }
+          if Self.isWatchOnlyBuild {
+            markCloudOperationFailure("Conexión HTTPS directa no disponible")
+            setCommandReceipt(CommandReceipt(
+              commandID: command.id,
+              state: .failed,
+              message: "No se pudo enviar por la conexión directa"
+            ))
+            return
+          }
           markCloudOperationFailure("HTTPS directo falló · usando iPhone")
           setCommandReceipt(CommandReceipt(
             commandID: command.id,
@@ -1029,6 +1042,14 @@ final class WatchRelay: NSObject, ObservableObject {
           sendThroughCompanion(commandID: command.id, data: data)
         }
       }
+      return command.id
+    }
+    if Self.isWatchOnlyBuild {
+      setCommandReceipt(CommandReceipt(
+        commandID: command.id,
+        state: .failed,
+        message: "Conexión directa no disponible"
+      ))
       return command.id
     }
     sendThroughCompanion(commandID: command.id, data: data)
@@ -1118,10 +1139,27 @@ final class WatchRelay: NSObject, ObservableObject {
           )
         } catch {
           guard let self else { return }
+          if Self.isWatchOnlyBuild {
+            markCloudOperationFailure("Conexión HTTPS directa no disponible")
+            commandReceipts[command.id] = CommandReceipt(
+              commandID: command.id,
+              state: .failed,
+              message: "No se pudo crear por la conexión directa"
+            )
+            return
+          }
           markCloudOperationFailure("HTTPS directo falló · usando iPhone")
           sendNewTaskThroughCompanion(commandID: command.id, data: data)
         }
       }
+      return command.id
+    }
+    if Self.isWatchOnlyBuild {
+      commandReceipts[command.id] = CommandReceipt(
+        commandID: command.id,
+        state: .failed,
+        message: "Conexión directa no disponible"
+      )
       return command.id
     }
     sendNewTaskThroughCompanion(commandID: command.id, data: data)
@@ -1168,7 +1206,9 @@ final class WatchRelay: NSObject, ObservableObject {
     commandReceipts[command.id] = CommandReceipt(
       commandID: command.id,
       state: .queued,
-      message: cloudClient == nil ? "Enviando audio al iPhone…" : "Enviando audio directamente…"
+      message: cloudClient == nil
+        ? (Self.isWatchOnlyBuild ? "Esperando conexión directa…" : "Enviando audio al iPhone…")
+        : "Enviando audio directamente…"
     )
     if let cloudClient {
       Task { [weak self] in
@@ -1192,6 +1232,15 @@ final class WatchRelay: NSObject, ObservableObject {
           )
         }
       }
+      return command.id
+    }
+    if Self.isWatchOnlyBuild {
+      try? FileManager.default.removeItem(at: fileURL)
+      commandReceipts[command.id] = CommandReceipt(
+        commandID: command.id,
+        state: .failed,
+        message: "Conexión directa no disponible"
+      )
       return command.id
     }
     sendVoiceThroughCompanion(command: command, metadata: metadata, fileURL: fileURL)
@@ -1286,11 +1335,20 @@ final class WatchRelay: NSObject, ObservableObject {
           } else {
             finishTaskRefreshAttempt(
               requestID: requestID,
-              error: "Sin conexión HTTPS directa ni iPhone"
+              error: Self.isWatchOnlyBuild
+                ? "Conexión directa no disponible"
+                : "Sin conexión HTTPS directa ni iPhone"
             )
           }
         }
       }
+      return
+    }
+    if Self.isWatchOnlyBuild {
+      finishTaskRefreshAttempt(
+        requestID: requestID,
+        error: "Conexión directa sin emparejar"
+      )
       return
     }
     refreshTasksThroughCompanion(requestID: requestID)
@@ -1358,16 +1416,16 @@ final class WatchRelay: NSObject, ObservableObject {
           try await Task.sleep(for: .seconds(45))
           guard let self, pendingProjectRequestID == requestID else { return }
           pendingProjectRequestID = nil
-          requestProjectsThroughCompanion()
+          if !Self.isWatchOnlyBuild { requestProjectsThroughCompanion() }
         } catch {
           guard let self, pendingProjectRequestID == requestID else { return }
           pendingProjectRequestID = nil
-          requestProjectsThroughCompanion()
+          if !Self.isWatchOnlyBuild { requestProjectsThroughCompanion() }
         }
       }
       return
     }
-    requestProjectsThroughCompanion()
+    if !Self.isWatchOnlyBuild { requestProjectsThroughCompanion() }
   }
 
   private func requestProjectsThroughCompanion() {
@@ -1437,10 +1495,16 @@ final class WatchRelay: NSObject, ObservableObject {
               revision: pending.revision
             )
           } else {
-            conversationErrors[pending.taskID] = "Sin conexión HTTPS directa ni iPhone"
+            conversationErrors[pending.taskID] = Self.isWatchOnlyBuild
+              ? "Conexión directa no disponible"
+              : "Sin conexión HTTPS directa ni iPhone"
           }
         }
       }
+      return
+    }
+    if Self.isWatchOnlyBuild {
+      conversationErrors[taskID] = "Conexión directa sin emparejar"
       return
     }
     loadConversationThroughCompanion(taskID: taskID, revision: revision)
@@ -1597,6 +1661,10 @@ final class WatchRelay: NSObject, ObservableObject {
   }
 
   func approveCloudPairing() {
+    guard !Self.isWatchOnlyBuild else {
+      cloudTransportStatus = "Sin emparejar · configura desde el Mac"
+      return
+    }
     guard let offer = pendingCloudPairingOffer ?? (try? CloudRelayKeyStore.loadPendingOffer(role: "watch")),
           let session,
           session.activationState == .activated else {
@@ -1625,6 +1693,11 @@ final class WatchRelay: NSObject, ObservableObject {
   }
 
   fileprivate func requestCloudPairingIfNeeded() {
+    guard !Self.isWatchOnlyBuild else {
+      pairingRequestInFlight = false
+      cloudTransportStatus = "Sin emparejar · configura desde el Mac"
+      return
+    }
     guard cloudClient == nil,
           pendingCloudPairingOffer == nil,
           !pairingRequestInFlight,
@@ -1734,7 +1807,9 @@ final class WatchRelay: NSObject, ObservableObject {
       guard let material else {
         CloudRelayKeyStore.setActivePairingID(nil, role: "watch")
         isCloudTransportActive = false
-        cloudTransportStatus = "Conexión directa sin emparejar"
+        cloudTransportStatus = Self.isWatchOnlyBuild
+          ? "Sin emparejar · configura desde el Mac"
+          : "Conexión directa sin emparejar"
         pairingRequestInFlight = false
         requestCloudPairingIfNeeded()
         return
@@ -1751,7 +1826,9 @@ final class WatchRelay: NSObject, ObservableObject {
       CloudRelayKeyStore.setActivePairingID(nil, role: "watch")
       cloudClient = nil
       isCloudTransportActive = false
-      cloudTransportStatus = "Conexión directa dañada · reemparejando"
+      cloudTransportStatus = Self.isWatchOnlyBuild
+        ? "Conexión directa dañada · configura desde el Mac"
+        : "Conexión directa dañada · reemparejando"
       pairingRequestInFlight = false
       requestCloudPairingIfNeeded()
     }
@@ -1842,7 +1919,7 @@ final class WatchRelay: NSObject, ObservableObject {
         failConversation(for: pending.taskID, message: failure.message)
       case .projects where pendingProjectRequestID == failure.requestID:
         pendingProjectRequestID = nil
-        requestProjectsThroughCompanion()
+        if !Self.isWatchOnlyBuild { requestProjectsThroughCompanion() }
       default:
         break
       }

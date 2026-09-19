@@ -3,6 +3,16 @@ import LocalAuthentication
 import Security
 
 enum SecureTokenStore {
+    #if os(watchOS)
+    private static let standaloneBundleID = "com.rgferreira.CodexWatchStandalone"
+    private static let legacyWatchAccessGroup =
+        "RR6C5FHDDS.com.rgferreira.CodexWatchCompanion.watchapp"
+
+    private static var shouldReadLegacyWatchKeychain: Bool {
+        Bundle.main.bundleIdentifier == standaloneBundleID
+    }
+    #endif
+
     enum StoreError: LocalizedError {
         case keychain(OSStatus)
         case invalidStoredValue
@@ -29,9 +39,29 @@ enum SecureTokenStore {
     }
 
     static func loadData(service: String, account: String) throws -> Data? {
+        if let value = try loadData(service: service, account: account, accessGroup: nil) {
+            return value
+        }
+        #if os(watchOS)
+        if shouldReadLegacyWatchKeychain {
+            return try loadData(
+                service: service,
+                account: account,
+                accessGroup: legacyWatchAccessGroup
+            )
+        }
+        #endif
+        return nil
+    }
+
+    private static func loadData(
+        service: String,
+        account: String,
+        accessGroup: String?
+    ) throws -> Data? {
         let authenticationContext = LAContext()
         authenticationContext.interactionNotAllowed = true
-        let query: [CFString: Any] = [
+        var query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
             kSecAttrAccount: account,
@@ -39,6 +69,7 @@ enum SecureTokenStore {
             kSecReturnData: true,
             kSecUseAuthenticationContext: authenticationContext
         ]
+        if let accessGroup { query[kSecAttrAccessGroup] = accessGroup }
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
         if status == errSecItemNotFound { return nil }
@@ -88,15 +119,29 @@ enum SecureTokenStore {
     }
 
     static func accounts(service: String) throws -> [String] {
+        var values = try accounts(service: service, accessGroup: nil)
+        #if os(watchOS)
+        if shouldReadLegacyWatchKeychain {
+            values.append(contentsOf: try accounts(
+                service: service,
+                accessGroup: legacyWatchAccessGroup
+            ))
+        }
+        #endif
+        return Array(Set(values)).sorted()
+    }
+
+    private static func accounts(service: String, accessGroup: String?) throws -> [String] {
         let authenticationContext = LAContext()
         authenticationContext.interactionNotAllowed = true
-        let query: [CFString: Any] = [
+        var query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
             kSecAttrService: service,
             kSecMatchLimit: kSecMatchLimitAll,
             kSecReturnAttributes: true,
             kSecUseAuthenticationContext: authenticationContext
         ]
+        if let accessGroup { query[kSecAttrAccessGroup] = accessGroup }
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
         if status == errSecItemNotFound { return [] }
