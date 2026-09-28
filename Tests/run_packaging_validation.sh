@@ -4,6 +4,7 @@ set -eu
 set -o pipefail
 
 readonly PROJECT="${0:A:h:h}/CodexWatch.xcodeproj"
+readonly ROOT="${0:A:h:h}"
 readonly DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode-27.app/Contents/Developer}"
 export DEVELOPER_DIR
 
@@ -75,5 +76,29 @@ for configuration in Debug Release; do
         exit 1
     }
 done
+
+readonly BOOTSTRAP_GROUP="com.rgferreira.CodexWatch.bootstrap"
+for entitlement in \
+    "$ROOT/Config/CodexWatchBridge.entitlements" \
+    "$ROOT/Config/WatchStandalone.entitlements"; do
+    /usr/libexec/PlistBuddy -c "Print :keychain-access-groups" "$entitlement" \
+        | /usr/bin/grep -Fq "$BOOTSTRAP_GROUP" || {
+        echo "$(basename "$entitlement"): missing shared standalone bootstrap Keychain group" >&2
+        exit 1
+    }
+done
+
+bridge_default_group="$(/usr/libexec/PlistBuddy -c 'Print :keychain-access-groups:0' \
+    "$ROOT/Config/CodexWatchBridge.entitlements")"
+watch_default_group="$(/usr/libexec/PlistBuddy -c 'Print :keychain-access-groups:0' \
+    "$ROOT/Config/WatchStandalone.entitlements")"
+[[ "$bridge_default_group" == *com.rgferreira.CodexWatchBridge ]] || {
+    echo "Bridge private Keychain group must remain first/default" >&2
+    exit 1
+}
+[[ "$watch_default_group" == *com.rgferreira.CodexWatchStandalone ]] || {
+    echo "Watch private Keychain group must remain first/default" >&2
+    exit 1
+}
 
 echo "Companion and Watch-only packaging validation passed"

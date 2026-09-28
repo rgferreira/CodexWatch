@@ -76,6 +76,19 @@ actor HeartbeatBox {
     func get() -> Bool { received }
 }
 
+actor VoiceConfigurationBox {
+    private var value = VoiceConfiguration.defaults()
+
+    func get() -> VoiceConfiguration { value }
+
+    func update(_ candidate: VoiceConfiguration) -> VoiceConfiguration {
+        if candidate.updatedAt >= value.updatedAt {
+            value = candidate
+        }
+        return value
+    }
+}
+
 @main
 struct BridgeCloudMailboxConsumerValidation {
     static func main() async throws {
@@ -88,6 +101,7 @@ struct BridgeCloudMailboxConsumerValidation {
         let statuses = StatusBox()
         let voices = VoiceBox()
         let heartbeats = HeartbeatBox()
+        let voiceConfiguration = VoiceConfigurationBox()
         let watchPrivate = CloudRelayProtocol.generatePrivateKey()
         let macPrivate = CloudRelayProtocol.generatePrivateKey()
         let watchPublic = try CloudRelayProtocol.publicKey(for: watchPrivate)
@@ -159,7 +173,11 @@ struct BridgeCloudMailboxConsumerValidation {
                 root: directory.appendingPathComponent("voice", isDirectory: true)
             ),
             operationStatus: { _ in await statuses.get() },
-            heartbeat: { _ in await heartbeats.markReceived() }
+            heartbeat: { _ in await heartbeats.markReceived() },
+            getVoiceConfiguration: { await voiceConfiguration.get() },
+            updateVoiceConfiguration: { candidate in
+                await voiceConfiguration.update(candidate)
+            }
         )
         let drained = try await consumer.drainOnce(waitSeconds: 0)
         precondition(drained)
@@ -350,6 +368,94 @@ struct BridgeCloudMailboxConsumerValidation {
         precondition(heartbeatPayload.operation == .heartbeatAck)
         let heartbeatAck = try heartbeatPayload.decode(CloudRelayProtocol.HeartbeatAck.self)
         precondition(heartbeatAck.requestID == heartbeatID)
+
+        let settingsRequestID = UUID()
+        let settingsRequest = try CloudRelayProtocol.seal(
+            payload: try .init(
+                commandID: settingsRequestID,
+                operation: .voiceSettingsRequest,
+                body: CloudVoiceSettingsRequest(requestedAt: Date())
+            ),
+            pairingID: pairingID,
+            direction: .watchToMac,
+            key: watchKey
+        )
+        await transport.seed(.init(
+            recordID: settingsRequest.context.recordName,
+            envelope: settingsRequest,
+            leaseToken: "lease-settings-request",
+            leaseExpiresAt: Date().addingTimeInterval(90)
+        ))
+        let drainedSettingsRequest = try await consumer.drainOnce(waitSeconds: 0)
+        precondition(drainedSettingsRequest)
+        let afterSettingsRequest = await transport.snapshot()
+        let settingsRequestPayload = try CloudRelayProtocol.open(
+            afterSettingsRequest.published.last!, expectedDirection: .macToWatch, key: watchKey
+        )
+        let initialSettings = try settingsRequestPayload.decode(CloudVoiceSettingsResponse.self)
+        precondition(initialSettings.requestID == settingsRequestID)
+        precondition(initialSettings.configuration.inputMode == .watchDictation)
+
+        let settingsUpdateID = UUID()
+        let updatedConfiguration = VoiceConfiguration(
+            inputMode: .openAIAPI,
+            transcriptionModel: .whisper1,
+            updatedAt: Date()
+        )
+        let settingsUpdate = try CloudRelayProtocol.seal(
+            payload: try .init(
+                commandID: settingsUpdateID,
+                operation: .voiceSettingsUpdate,
+                body: CloudVoiceSettingsUpdate(
+                    requestID: settingsUpdateID,
+                    configuration: updatedConfiguration
+                )
+            ),
+            pairingID: pairingID,
+            direction: .watchToMac,
+            key: watchKey
+        )
+        await transport.seed(.init(
+            recordID: settingsUpdate.context.recordName,
+            envelope: settingsUpdate,
+            leaseToken: "lease-settings-update",
+            leaseExpiresAt: Date().addingTimeInterval(90)
+        ))
+        let drainedSettingsUpdate = try await consumer.drainOnce(waitSeconds: 0)
+        precondition(drainedSettingsUpdate)
+        let afterSettingsUpdate = await transport.snapshot()
+        let settingsUpdatePayload = try CloudRelayProtocol.open(
+            afterSettingsUpdate.published.last!, expectedDirection: .macToWatch, key: watchKey
+        )
+        let updatedSettings = try settingsUpdatePayload.decode(CloudVoiceSettingsResponse.self)
+        precondition(updatedSettings.requestID == settingsUpdateID)
+        precondition(updatedSettings.configuration.inputMode == updatedConfiguration.inputMode)
+        precondition(
+            updatedSettings.configuration.transcriptionModel
+                == updatedConfiguration.transcriptionModel
+        )
+        precondition(
+            abs(updatedSettings.configuration.updatedAt.timeIntervalSince(
+                updatedConfiguration.updatedAt
+            )) < 1.1
+        )
+        let storedVoiceConfiguration = await voiceConfiguration.get()
+        precondition(storedVoiceConfiguration == updatedSettings.configuration)
+
+        let macConfiguration = VoiceConfiguration(
+            inputMode: .watchDictation,
+            transcriptionModel: .gpt4oMiniTranscribe,
+            updatedAt: Date().addingTimeInterval(2)
+        )
+        try await consumer.publishVoiceConfiguration(macConfiguration)
+        let afterMacSettings = await transport.snapshot()
+        let macSettingsPayload = try CloudRelayProtocol.open(
+            afterMacSettings.published.last!, expectedDirection: .macToWatch, key: watchKey
+        )
+        precondition(macSettingsPayload.operation == .voiceSettingsResponse)
+        let macSettings = try macSettingsPayload.decode(CloudVoiceSettingsResponse.self)
+        precondition(macSettings.configuration.inputMode == .watchDictation)
+        precondition(macSettings.configuration.transcriptionModel == .gpt4oMiniTranscribe)
 
         try? FileManager.default.removeItem(at: directory)
         print("Bridge cloud mailbox consumer validation passed")

@@ -36,6 +36,17 @@ private struct BridgeMenuView: View {
                 NSApplication.shared.activate(ignoringOtherApps: true)
                 openWindow(id: "bridge")
             }
+            Button(
+                controller.isCloudRelayPaired
+                    ? "Reemparejar Watch sin iPhone"
+                    : "Emparejar Watch sin iPhone"
+            ) {
+                controller.prepareStandalonePairing()
+            }
+            if let code = controller.pendingCloudPairingCode {
+                Text("Código Watch: \(code)")
+                    .font(.system(.caption, design: .monospaced))
+            }
             Button("Actualizar tareas") { Task { await controller.refreshTasks() } }
             Button("Salir") { NSApplication.shared.terminate(nil) }
         }
@@ -82,6 +93,13 @@ private struct BridgeConfigurationView: View {
                             .font(.system(.title, design: .monospaced).bold())
                             .textSelection(.enabled)
                     }
+                    Button(
+                        controller.isCloudRelayPaired
+                            ? "Reemparejar Watch sin iPhone"
+                            : "Emparejar Watch sin iPhone"
+                    ) {
+                        controller.prepareStandalonePairing()
+                    }
                     Text("El buzón es cifrado de extremo a extremo y el Mac solo realiza conexiones HTTPS salientes.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -89,6 +107,30 @@ private struct BridgeConfigurationView: View {
             }
             GroupBox("Transcripción de notas de voz") {
                 VStack(alignment: .leading, spacing: 10) {
+                    Picker(
+                        "Método",
+                        selection: Binding(
+                            get: { controller.voiceInputMode },
+                            set: { controller.setVoiceInputMode($0) }
+                        )
+                    ) {
+                        ForEach(VoiceInputMode.allCases) { mode in
+                            Text(mode.displayName).tag(mode)
+                        }
+                    }
+                    if controller.voiceInputMode == .openAIAPI {
+                        Picker(
+                            "Modelo",
+                            selection: Binding(
+                                get: { controller.transcriptionModel },
+                                set: { controller.setTranscriptionModel($0) }
+                            )
+                        ) {
+                            ForEach(OpenAITranscriptionModel.allCases) { model in
+                                Text(model.displayName).tag(model)
+                            }
+                        }
+                    }
                     Label(
                         controller.hasOpenAIAPIKey ? "API key configurada" : "API key no configurada",
                         systemImage: controller.hasOpenAIAPIKey ? "checkmark.shield.fill" : "key"
@@ -102,7 +144,7 @@ private struct BridgeConfigurationView: View {
                         }
                     }
                     .disabled(openAIAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    Text("Solo se usa cuando el Companion selecciona OpenAI API. La transcripción genera facturación en tu cuenta de API.")
+                    Text("Solo se usa cuando el Watch selecciona OpenAI API. La transcripción genera facturación en tu cuenta de API.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Text("La clave permanece en el llavero del Mac y nunca se envía al iPhone, al Watch ni se guarda en el repositorio.")
@@ -124,6 +166,7 @@ final class BridgeController: ObservableObject {
     private static let tokenAccount = "bridge-access-token"
     private static let openAIKeyService = "com.rgferreira.CodexWatchBridge.openai"
     private static let openAIKeyAccount = "api-key"
+    private static let voiceConfigurationDefaultsKey = "standaloneVoiceConfiguration"
     private static let logger = Logger(subsystem: "com.rgferreira.CodexWatchBridge", category: "Bridge")
 
     @Published private(set) var status = "Iniciando…"
@@ -135,6 +178,8 @@ final class BridgeController: ObservableObject {
     @Published private(set) var cloudRelayStatus = "No configurado"
     @Published private(set) var pendingCloudPairingCode: String?
     @Published private(set) var isCloudRelayPaired = false
+    @Published private(set) var voiceInputMode: VoiceInputMode = .watchDictation
+    @Published private(set) var transcriptionModel: OpenAITranscriptionModel = .gptTranscribe
 
     private let appServer = CodexAppServerClient()
     private let openAITranscriber = OpenAITranscriptionClient()
@@ -142,6 +187,8 @@ final class BridgeController: ObservableObject {
     private var retryTask: Task<Void, Never>?
     private var connectionMonitorTask: Task<Void, Never>?
     private var cloudConsumerTask: Task<Void, Never>?
+    private var activeCloudConsumer: BridgeCloudMailboxConsumer?
+    private var standalonePairingTask: Task<Void, Never>?
     private var isHTTPReady = false
     private var isCodexReady = false
     private var refreshInProgress = false
@@ -152,6 +199,8 @@ final class BridgeController: ObservableObject {
     private var lastSuccessfulCloudWatchContact: Date?
     private var cloudProvisioning: BridgeCloudRelayProvisioning?
     private var pendingCloudPairing: CloudRelayPairingOffer?
+    private var pendingStandaloneOffer: CloudRelayStandaloneBootstrapOffer?
+    private var voiceConfiguration = VoiceConfiguration.defaults()
     private var cloudTransportConfigured = false
     private var authenticationLimiter = AuthenticationRateLimiter()
     private var commandReceipts: [UUID: CommandReceipt] = [:]
@@ -173,6 +222,12 @@ final class BridgeController: ObservableObject {
     init() {
         Self.audit("codexwatch_controller_initializing")
         UserDefaults.standard.removeObject(forKey: "pairingCode")
+        if let data = UserDefaults.standard.data(forKey: Self.voiceConfigurationDefaultsKey),
+           let stored = try? CodexWatchWire.decode(VoiceConfiguration.self, from: data) {
+            voiceConfiguration = stored
+            voiceInputMode = stored.inputMode
+            transcriptionModel = stored.transcriptionModel
+        }
         do {
             accessToken = try SecureTokenStore.loadOrCreate(
                 service: Self.tokenService,
@@ -232,6 +287,61 @@ final class BridgeController: ObservableObject {
         } catch {
             status = "No se pudo guardar la API key: \(error.localizedDescription)"
             return false
+        }
+    }
+
+    func setVoiceInputMode(_ mode: VoiceInputMode) {
+        guard voiceInputMode != mode else { return }
+        voiceInputMode = mode
+        saveAndPublishVoiceConfiguration()
+    }
+
+    func setTranscriptionModel(_ model: OpenAITranscriptionModel) {
+        guard transcriptionModel != model else { return }
+        transcriptionModel = model
+        saveAndPublishVoiceConfiguration()
+    }
+
+    private func saveAndPublishVoiceConfiguration() {
+        let configuration = VoiceConfiguration.updated(
+            inputMode: voiceInputMode,
+            transcriptionModel: transcriptionModel
+        )
+        _ = acceptVoiceConfiguration(configuration)
+        guard let consumer = activeCloudConsumer else { return }
+        Task {
+            do {
+                try await consumer.publishVoiceConfiguration(configuration)
+            } catch {
+                Self.audit("codexwatch_voice_settings_publish result=failure")
+            }
+        }
+    }
+
+    func prepareStandalonePairing() {
+        standalonePairingTask?.cancel()
+        do {
+            guard let provisioning = cloudProvisioning else {
+                throw NSError(
+                    domain: "CodexWatch.CloudRelay",
+                    code: 3,
+                    userInfo: [NSLocalizedDescriptionKey: "El buzón HTTPS no está aprovisionado"]
+                )
+            }
+            let identity = try CloudRelayKeyStore.loadOrCreateIdentity(role: "mac")
+            let offer = CloudRelayStandaloneBootstrapOffer(
+                configuration: provisioning.transportConfiguration,
+                macDeviceID: identity.deviceID,
+                macPublicKey: try CloudRelayProtocol.publicKey(for: identity.privateKey)
+            )
+            try? CloudRelayBootstrapStore.deleteResponse()
+            try CloudRelayBootstrapStore.saveOffer(offer)
+            pendingStandaloneOffer = offer
+            pendingCloudPairingCode = nil
+            cloudRelayStatus = "Oferta segura en iCloud · abre Codex Watch"
+            monitorStandalonePairing(offer)
+        } catch {
+            cloudRelayStatus = "No se pudo preparar el pairing: \(error.localizedDescription)"
         }
     }
 
@@ -742,11 +852,94 @@ final class BridgeController: ObservableObject {
                ), pairing.isApproved {
                 isCloudRelayPaired = true
                 startCloudConsumer(pairing: pairing, provisioning: provisioning)
+            } else {
+                prepareStandalonePairing()
             }
         } catch {
             cloudRelayStatus = "Buzón HTTPS no aprovisionado"
             Self.logger.info("El transporte HTTPS todavía no está disponible: \(error.localizedDescription, privacy: .public)")
         }
+    }
+
+    private func monitorStandalonePairing(
+        _ offer: CloudRelayStandaloneBootstrapOffer
+    ) {
+        standalonePairingTask?.cancel()
+        standalonePairingTask = Task { [weak self] in
+            while !Task.isCancelled, Date() <= offer.expiresAt {
+                do {
+                    if let response = try CloudRelayBootstrapStore.loadResponse(),
+                       response.matches(offer) {
+                        guard let self else { return }
+                        pendingCloudPairingCode = response.authenticationCode
+                        cloudRelayStatus = response.approvedOnWatch
+                            ? "Código confirmado · activando HTTPS"
+                            : "Compara el código y confirma en el Watch"
+                        if response.approvedOnWatch {
+                            try finishStandalonePairing(offer: offer, response: response)
+                            return
+                        }
+                    }
+                } catch {
+                    Self.logger.info(
+                        "El bootstrap de iCloud sigue pendiente: \(error.localizedDescription, privacy: .public)"
+                    )
+                }
+                try? await Task.sleep(for: .seconds(3))
+            }
+            guard !Task.isCancelled, let self,
+                  pendingStandaloneOffer?.bootstrapID == offer.bootstrapID else { return }
+            pendingStandaloneOffer = nil
+            pendingCloudPairingCode = nil
+            cloudRelayStatus = "El emparejamiento caducó · inténtalo de nuevo"
+        }
+    }
+
+    private func finishStandalonePairing(
+        offer: CloudRelayStandaloneBootstrapOffer,
+        response: CloudRelayStandaloneBootstrapResponse
+    ) throws {
+        guard response.matches(offer), response.approvedOnWatch,
+              let provisioning = cloudProvisioning,
+              provisioning.pairingID == offer.configuration.pairingID else {
+            throw CloudRelayProtocol.ProtocolError.authenticationFailed
+        }
+        let identity = try CloudRelayKeyStore.loadOrCreateIdentity(role: "mac")
+        guard identity.deviceID == offer.macDeviceID,
+              try CloudRelayProtocol.publicKey(for: identity.privateKey) == offer.macPublicKey else {
+            throw CloudRelayProtocol.ProtocolError.authenticationFailed
+        }
+        let pairing = CloudRelayProtocol.PairingMaterial(
+            pairingID: offer.configuration.pairingID,
+            deviceID: identity.deviceID,
+            privateKey: identity.privateKey,
+            peerPublicKey: response.watchPublicKey,
+            approvedAt: Date()
+        )
+        try CloudRelayKeyStore.savePairing(pairing, role: "mac")
+        try CloudRelayKeyStore.saveTransport(offer.configuration, role: "mac")
+        CloudRelayKeyStore.setActivePairingID(pairing.pairingID, role: "mac")
+        pendingStandaloneOffer = nil
+        pendingCloudPairingCode = nil
+        isCloudRelayPaired = true
+        CloudRelayBootstrapStore.clear()
+        startCloudConsumer(pairing: pairing, provisioning: provisioning)
+    }
+
+    private func currentVoiceConfiguration() -> VoiceConfiguration {
+        voiceConfiguration
+    }
+
+    private func acceptVoiceConfiguration(_ candidate: VoiceConfiguration) -> VoiceConfiguration {
+        if candidate.updatedAt >= voiceConfiguration.updatedAt {
+            voiceConfiguration = candidate
+            voiceInputMode = candidate.inputMode
+            transcriptionModel = candidate.transcriptionModel
+            if let data = try? CodexWatchWire.encode(candidate) {
+                UserDefaults.standard.set(data, forKey: Self.voiceConfigurationDefaultsKey)
+            }
+        }
+        return voiceConfiguration
     }
 
     private func beginCloudPairing(
@@ -830,6 +1023,7 @@ final class BridgeController: ObservableObject {
         provisioning: BridgeCloudRelayProvisioning
     ) {
         cloudConsumerTask?.cancel()
+        activeCloudConsumer = nil
         do {
             let transport = BlindMailboxHTTPClient(configuration: try .init(
                 baseURL: provisioning.baseURL,
@@ -873,8 +1067,15 @@ final class BridgeController: ObservableObject {
                 },
                 heartbeat: { [weak self] _ in
                     await self?.recordCloudHeartbeat()
+                },
+                getVoiceConfiguration: { [weak self] in
+                    await self?.currentVoiceConfiguration() ?? .defaults()
+                },
+                updateVoiceConfiguration: { [weak self] configuration in
+                    await self?.acceptVoiceConfiguration(configuration) ?? configuration
                 }
             )
+            activeCloudConsumer = consumer
             cloudTransportConfigured = true
             cloudRelayStatus = "Emparejado · esperando al Watch"
             cloudConsumerTask = Task { [weak self] in
@@ -1128,8 +1329,8 @@ private extension BridgeConnectionState {
 
     var helpText: String {
         switch self {
-        case .connected: "Codex Watch conectado al iPhone"
-        case .waitingForCompanion: "Puente preparado; sin contacto reciente del iPhone"
+        case .connected: "Codex Watch conectado"
+        case .waitingForCompanion: "Puente preparado; sin contacto reciente del Watch o iPhone"
         case .unavailable: "Codex Watch no está disponible"
         }
     }

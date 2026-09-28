@@ -6,6 +6,7 @@
 	<array>
 		<string>$(AppIdentifierPrefix)com.rgferreira.CodexWatchStandalone</string>
 		<string>$(AppIdentifierPrefix)com.rgferreira.CodexWatchCompanion.watchapp</string>
+		<string>$(AppIdentifierPrefix)com.rgferreira.CodexWatch.bootstrap</string>
 	</array>
 </dict>
 </plist>

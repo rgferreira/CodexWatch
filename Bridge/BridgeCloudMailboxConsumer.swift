@@ -19,6 +19,8 @@ actor BridgeCloudMailboxConsumer {
     typealias DeliverVoice = @Sendable (CodexVoiceCommand, Data) async -> DeliveryOutcome
     typealias OperationStatus = @Sendable (UUID) async throws -> String
     typealias Heartbeat = @Sendable (Date) async -> Void
+    typealias GetVoiceConfiguration = @Sendable () async -> VoiceConfiguration
+    typealias UpdateVoiceConfiguration = @Sendable (VoiceConfiguration) async -> VoiceConfiguration
 
     private static let logger = Logger(
         subsystem: "com.rgferreira.CodexWatchBridge",
@@ -40,6 +42,8 @@ actor BridgeCloudMailboxConsumer {
     private let voiceInbox: CloudVoiceInbox
     private let operationStatus: OperationStatus
     private let heartbeat: Heartbeat
+    private let getVoiceConfiguration: GetVoiceConfiguration
+    private let updateVoiceConfiguration: UpdateVoiceConfiguration
 
     init(
         transport: any BlindMailboxTransport,
@@ -55,7 +59,11 @@ actor BridgeCloudMailboxConsumer {
         deliverVoice: @escaping DeliverVoice = { _, _ in .rejected("Voz directa no disponible") },
         voiceInbox: CloudVoiceInbox? = nil,
         operationStatus: @escaping OperationStatus,
-        heartbeat: @escaping Heartbeat = { _ in }
+        heartbeat: @escaping Heartbeat = { _ in },
+        getVoiceConfiguration: @escaping GetVoiceConfiguration = {
+            VoiceConfiguration.defaults()
+        },
+        updateVoiceConfiguration: @escaping UpdateVoiceConfiguration = { $0 }
     ) throws {
         self.transport = transport
         self.outbox = outbox
@@ -74,6 +82,8 @@ actor BridgeCloudMailboxConsumer {
         self.voiceInbox = try voiceInbox ?? CloudVoiceInbox()
         self.operationStatus = operationStatus
         self.heartbeat = heartbeat
+        self.getVoiceConfiguration = getVoiceConfiguration
+        self.updateVoiceConfiguration = updateVoiceConfiguration
     }
 
     /// Drains only one item so the caller can apply bounded backoff and a circuit
@@ -269,9 +279,53 @@ actor BridgeCloudMailboxConsumer {
                 try await acknowledge(claim)
             }
             return true
+        case .voiceSettingsRequest:
+            _ = try payload.decode(CloudVoiceSettingsRequest.self)
+            let configuration = await getVoiceConfiguration()
+            try await publish(
+                commandID: payload.commandID,
+                operation: .voiceSettingsResponse,
+                body: CloudVoiceSettingsResponse(
+                    requestID: payload.commandID,
+                    configuration: configuration
+                )
+            )
+            try await acknowledge(claim)
+            return true
+        case .voiceSettingsUpdate:
+            let update = try payload.decode(CloudVoiceSettingsUpdate.self)
+            guard update.requestID == payload.commandID else {
+                throw CloudRelayProtocol.ProtocolError.recordBindingMismatch
+            }
+            let configuration = await updateVoiceConfiguration(update.configuration)
+            try await publish(
+                commandID: payload.commandID,
+                operation: .voiceSettingsResponse,
+                body: CloudVoiceSettingsResponse(
+                    requestID: payload.commandID,
+                    configuration: configuration
+                )
+            )
+            try await acknowledge(claim)
+            return true
         default:
             throw CloudRelayProtocol.ProtocolError.operationMismatch
         }
+    }
+
+    /// Pushes a preference change initiated on the Mac. It is still carried
+    /// inside the already-approved E2E channel; the blind mailbox only sees
+    /// ciphertext and transport metadata.
+    func publishVoiceConfiguration(_ configuration: VoiceConfiguration) async throws {
+        let requestID = UUID()
+        try await publish(
+            commandID: requestID,
+            operation: .voiceSettingsResponse,
+            body: CloudVoiceSettingsResponse(
+                requestID: requestID,
+                configuration: configuration
+            )
+        )
     }
 
     private func handleWrite(

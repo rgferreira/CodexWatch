@@ -31,6 +31,9 @@ enum CloudRelayProtocol {
         case conversationResponse
         case readFailure
         case voiceChunk
+        case voiceSettingsRequest
+        case voiceSettingsUpdate
+        case voiceSettingsResponse
     }
 
     struct Heartbeat: Codable, Hashable, Sendable {
@@ -313,7 +316,8 @@ enum CloudRelayProtocol {
     static func shortAuthenticationString(
         pairingID: String,
         firstPublicKey: Data,
-        secondPublicKey: Data
+        secondPublicKey: Data,
+        binding: Data = Data()
     ) -> String {
         let ordered = firstPublicKey.lexicographicallyPrecedes(secondPublicKey)
             ? [firstPublicKey, secondPublicKey]
@@ -321,6 +325,10 @@ enum CloudRelayProtocol {
         var input = Data("CodexWatch.Pairing.SAS.v1|\(pairingID)|".utf8)
         input.append(ordered[0])
         input.append(ordered[1])
+        if !binding.isEmpty {
+            input.append(Data("|bootstrap-v1|".utf8))
+            input.append(binding)
+        }
         let digest = SHA256.hash(data: input)
         let value = digest.prefix(4).reduce(UInt32.zero) { ($0 << 8) | UInt32($1) }
         return String(format: "%06u", value % 1_000_000)

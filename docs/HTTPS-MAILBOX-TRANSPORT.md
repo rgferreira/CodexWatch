@@ -1,10 +1,10 @@
 # Independent Watch transport
 
-Status: protocol and first text slice validated locally and against the deployed
-Cloudflare Worker. The pilot mailbox and its first pairing were provisioned on
-2026-08-26. Build 0.7/29 adds verified pairing and direct Watch-to-Mac text
-commands; the stable rollback point remains `codexwatch-v0.6-build28-stable`
-(`5fd8d18`).
+Status: the protocol, text, read models and chunked audio path are validated
+locally and against the deployed Cloudflare Worker. The pilot mailbox and its
+first pairing were provisioned on 2026-08-26. Build 0.8/44 adds autonomous
+first-run pairing and encrypted voice-preference synchronization; the stable
+rollback point remains `codexwatch-v0.6-build28-stable` (`5fd8d18`).
 
 ## Decision record
 
@@ -44,6 +44,13 @@ Both paths preserve the UUID created once by the Watch, producing the same
 - Pairing must finish with a short-authentication-string check on both devices;
   server-side public-key substitution must never be silently accepted.
 
+For a new Watch, the Mac writes one 15-minute bootstrap offer into the user's
+end-to-end encrypted iCloud Keychain. The Watch creates its own X25519 identity,
+writes a response bound to the exact offer, and both devices display the same
+six-digit short authentication string. Neither side promotes the keys to an
+active mailbox pairing until the user approves the code on the Watch. The
+Cloudflare Worker is not involved in bootstrap and learns none of its material.
+
 The encrypted payload binds command UUID, operation class and body hash. Reusing
 the same command UUID with different text yields HTTP 409, never overwrite.
 Receipt records use a state discriminator while retaining the same command UUID,
@@ -55,8 +62,9 @@ mailbox still recognizes the identical command. The transport request MAC always
 binds the exact ciphertext bytes. A changed payload produces another semantic
 digest and HTTP 409.
 
-The first slice is text only and limits plaintext to 64 KiB. Audio remains out of
-scope until text is proven on the deployed Worker.
+Text and read-model messages remain bounded to 64 KiB plaintext. Voice notes are
+split into bounded encrypted chunks and reassembled on the Mac only after hash,
+order and completeness checks.
 
 ## Provider-neutral HTTPS contract
 
@@ -103,6 +111,9 @@ source of truth.
 - journal restart recovery and file mode 0600;
 - signed macOS build after removal of the unsupported CloudKit entitlement.
 - live encrypted upload, claim, decrypt and ACK against the deployed Worker.
+- signed Watch and macOS builds containing the same Keychain access group;
+- bootstrap expiry, exact-offer binding, SAS agreement and foreign-offer rejection;
+- bidirectional voice-mode and transcription-model round trips over E2E envelopes.
 
 The HTTP client is exercised against `Tests/mock_mailbox_server.py`; the mock is
 test-only and is never exposed outside loopback.

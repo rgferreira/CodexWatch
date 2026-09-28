@@ -308,6 +308,49 @@ enum OpenAITranscriptionModel: String, Codable, CaseIterable, Identifiable, Send
     var usesDiarizedResponse: Bool { self == .gpt4oTranscribeDiarize }
 }
 
+struct VoiceConfiguration: Codable, Hashable, Sendable {
+    let inputMode: VoiceInputMode
+    let transcriptionModel: OpenAITranscriptionModel
+    let updatedAt: Date
+
+    static func defaults(at date: Date = Date.distantPast) -> Self {
+        .init(
+            inputMode: .watchDictation,
+            transcriptionModel: .gptTranscribe,
+            updatedAt: date
+        )
+    }
+
+    /// CodexWatchWire uses ISO-8601 second precision. Normalize mutations to
+    /// that same precision so a settings echo cannot look older than the value
+    /// that originated it and trigger an update loop.
+    static func updated(
+        inputMode: VoiceInputMode,
+        transcriptionModel: OpenAITranscriptionModel,
+        at date: Date = Date()
+    ) -> Self {
+        .init(
+            inputMode: inputMode,
+            transcriptionModel: transcriptionModel,
+            updatedAt: Date(timeIntervalSince1970: floor(date.timeIntervalSince1970))
+        )
+    }
+}
+
+struct CloudVoiceSettingsRequest: Codable, Hashable, Sendable {
+    let requestedAt: Date
+}
+
+struct CloudVoiceSettingsUpdate: Codable, Hashable, Sendable {
+    let requestID: UUID
+    let configuration: VoiceConfiguration
+}
+
+struct CloudVoiceSettingsResponse: Codable, Hashable, Sendable {
+    let requestID: UUID
+    let configuration: VoiceConfiguration
+}
+
 struct CodexVoiceCommand: Codable, Identifiable, Hashable, Sendable {
     let id: UUID
     let taskID: String
@@ -354,13 +397,21 @@ struct PendingTextCommandOutbox: Codable, Hashable, Sendable {
     struct Intent: Codable, Hashable, Sendable {
         let command: CodexCommand
         var receipt: CommandReceipt
+        /// Nil means that the command still only exists on the Watch. Keeping
+        /// this optional preserves decoding of outboxes written by older builds;
+        /// those commands are conservatively retried with their original UUID.
+        var transportAcceptedAt: Date?
     }
 
     private(set) var intents: [Intent] = []
 
     mutating func record(_ command: CodexCommand, receipt: CommandReceipt) {
         intents.removeAll { $0.command.id == command.id }
-        intents.append(Intent(command: command, receipt: receipt))
+        intents.append(Intent(
+            command: command,
+            receipt: receipt,
+            transportAcceptedAt: nil
+        ))
         intents.sort { $0.command.createdAt < $1.command.createdAt }
         if intents.count > 100 {
             intents.removeFirst(intents.count - 100)
@@ -378,6 +429,18 @@ struct PendingTextCommandOutbox: Codable, Hashable, Sendable {
         }
     }
 
+    mutating func markTransportAccepted(
+        _ receipt: CommandReceipt,
+        at date: Date = Date()
+    ) {
+        guard receipt.state == .queued,
+              let index = intents.firstIndex(where: { $0.command.id == receipt.commandID }) else {
+            return
+        }
+        intents[index].receipt = receipt
+        intents[index].transportAcceptedAt = date
+    }
+
     func latest(taskID: String) -> Intent? {
         intents.last { $0.command.taskID == taskID && $0.receipt.state == .queued }
     }
@@ -388,6 +451,16 @@ struct PendingTextCommandOutbox: Codable, Hashable, Sendable {
             $0.command.taskID == taskID
                 && $0.receipt.state == .queued
                 && Self.normalized($0.command.text) == normalizedText
+        }
+    }
+
+    func pending() -> [Intent] {
+        intents.filter { $0.receipt.state == .queued }
+    }
+
+    func pendingTransportUpload() -> [Intent] {
+        intents.filter {
+            $0.receipt.state == .queued && $0.transportAcceptedAt == nil
         }
     }
 

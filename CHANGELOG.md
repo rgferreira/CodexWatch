@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.8.1 — build 45 (2026-09-25)
+
+- Never removes a text command from the Watch outbox because of a transient
+  HTTPS or connectivity failure.
+- Replays every locally queued command after reconnection and restart with its
+  original UUID, so Relay's operation idempotency prevents duplicate turns.
+- Distinguishes «guardada en el Watch» from transport acceptance and keeps the
+  pending state visible until a terminal receipt arrives.
+- Adds regression coverage proving that a queued retry remains durable while a
+  completed receipt still removes it exactly once.
+
+## v0.8.0 — build 44 (2026-09-21)
+
+- Adds first-run Watch-to-Mac pairing without the iPhone Companion. The Mac
+  publishes a 15-minute bootstrap offer through the user's end-to-end encrypted
+  iCloud Keychain; the Watch creates its own X25519 identity and both devices
+  require the same six-digit verification code before activation.
+- Keeps the Cloudflare mailbox blind: no pairing secret, Codex credential,
+  prompt or audio is made readable to the Worker.
+- Adds voice input and transcription-model controls to both the Watch and the
+  Mac Bridge, synchronized through the approved encrypted mailbox.
+- Retains the last valid pairing during a cancelled re-pairing attempt and adds
+  regression tests for expiry, key binding, tampering, settings round trips,
+  packaging and signed entitlements.
+- Defers TestFlight/App Store distribution without a target date. Development
+  signing remains the supported installation route for this release.
+
 ## v0.7.1 — build 42 (2026-09-18)
 
 - Replaces the split Personal Team identities with one coherent iPhone and

@@ -9,6 +9,7 @@ actor WatchCloudRelayClient {
         case conversation(CloudConversationResponse)
         case readFailure(CloudReadFailure)
         case heartbeatAck(CloudRelayProtocol.HeartbeatAck)
+        case voiceSettings(CloudVoiceSettingsResponse)
     }
 
     private let transport: any BlindMailboxTransport
@@ -88,6 +89,28 @@ actor WatchCloudRelayClient {
             commandID: requestID,
             operation: .conversationRequest,
             body: CloudConversationRequest(taskID: taskID, revision: revision)
+        )
+    }
+
+    func requestVoiceSettings(requestID: UUID) async throws {
+        try await put(
+            commandID: requestID,
+            operation: .voiceSettingsRequest,
+            body: CloudVoiceSettingsRequest(requestedAt: Date())
+        )
+    }
+
+    func updateVoiceSettings(
+        requestID: UUID,
+        configuration: VoiceConfiguration
+    ) async throws {
+        try await put(
+            commandID: requestID,
+            operation: .voiceSettingsUpdate,
+            body: CloudVoiceSettingsUpdate(
+                requestID: requestID,
+                configuration: configuration
+            )
         )
     }
 
@@ -188,6 +211,12 @@ actor WatchCloudRelayClient {
                     throw CloudRelayProtocol.ProtocolError.recordBindingMismatch
                 }
                 event = .heartbeatAck(acknowledgment)
+            case .voiceSettingsResponse:
+                let response = try payload.decode(CloudVoiceSettingsResponse.self)
+                guard response.requestID == payload.commandID else {
+                    throw CloudRelayProtocol.ProtocolError.recordBindingMismatch
+                }
+                event = .voiceSettings(response)
             default:
                 throw CloudRelayProtocol.ProtocolError.operationMismatch
             }

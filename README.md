@@ -6,12 +6,17 @@ An experimental app for selecting a recent Codex task from Apple Watch, reading 
 
 ## Current stable release
 
-**Codex Watch v0.7.0 · build 41** is the first stable release of the independent
-Watch transport. It supports encrypted Watch-to-Mac operation without the
-iPhone, synchronized task and project lists, bounded conversation history,
-task creation, text and voice commands, and the iPhone/ZeroTier route as a
-fallback. Build 41 also prevents a full mailbox response batch from trapping
-conversation history in an endless loading state. See [CHANGELOG.md](CHANGELOG.md).
+**Codex Watch v0.8.1 · build 45** makes the independent Watch path self-contained
+and resilient to temporary connectivity failures.
+It pairs directly with the Mac using a short-lived, end-to-end encrypted iCloud
+Keychain rendezvous and a six-digit verification code, without requiring the
+iPhone Companion. Voice mode and transcription model can be selected on either
+the Watch or Mac and are synchronized through the encrypted mailbox. The
+iPhone/ZeroTier path remains available as a fallback. Text commands that have
+not reached HTTPS remain visibly queued on the Watch and retry with their
+original UUID after reconnection; an accepted command is never uploaded again.
+See
+[CHANGELOG.md](CHANGELOG.md).
 
 ## See it in action
 
@@ -23,6 +28,8 @@ conversation history in an endless loading state. See [CHANGELOG.md](CHANGELOG.m
 
 - `CodexWatch`: iPhone companion app and WatchConnectivity link.
 - `CodexWatch Watch App`: chronological task picker, message reader, voice input, and command delivery.
+- `CodexWatch Standalone`: Watch-only build with direct HTTPS transport and no
+  runtime dependency on the iPhone app.
 - `CodexWatchBridge`: authenticated local bridge that uses Relay's loopback
   `CodexController`; it owns no Codex App Server process or writer path.
 
@@ -36,12 +43,12 @@ The `+` icon in the top corner of the task list creates a new task. Its picker m
 
 ## Voice commands
 
-The companion app provides two paths:
+The Watch and Mac Bridge provide two selectable paths:
 
 - **Apple Watch dictation:** the Watch converts speech to text and the app sends that text to Codex. This path does not use the OpenAI API.
-- **OpenAI API:** the Watch records an AAC/M4A voice note and transfers it without transcription to the iPhone and Mac. The bridge sends it to the OpenAI transcription endpoint and delivers the resulting text to the selected task. This option incurs API charges.
+- **OpenAI API:** the Watch records an AAC/M4A voice note and transfers it without transcription directly to the Mac over the encrypted mailbox. The bridge sends it to the OpenAI transcription endpoint and delivers the resulting text to the selected task. This option incurs API charges.
 
-The Companion lets you select any of the six supported file-transcription models: `gpt-transcribe`, `gpt-4o-transcribe`, `gpt-4o-mini-transcribe`, `gpt-4o-mini-transcribe-2025-12-15`, `gpt-4o-transcribe-diarize`, and `whisper-1`. The API key is configured in Codex Watch Bridge and stored only in the Mac Keychain.
+The Watch and Mac Bridge let you select any of the six supported file-transcription models: `gpt-transcribe`, `gpt-4o-transcribe`, `gpt-4o-mini-transcribe`, `gpt-4o-mini-transcribe-2025-12-15`, `gpt-4o-transcribe-diarize`, and `whisper-1`. The preference is synchronized only inside the approved E2E channel. The API key is configured in Codex Watch Bridge and stored only in the Mac Keychain.
 
 The bridge sends every write to Relay's loopback Controller with an idempotency identifier. Relay is responsible for per-thread ordering, App Server lifecycle, bounded interruption and completion. The Watch reports success only after Relay confirms the final `turn/completed`.
 
@@ -51,13 +58,14 @@ In the iPhone app, configure the connection method, the Mac's IP address or host
 
 For use away from home, the active bridge configuration uses the Mac's detected private ZeroTier IP address. The client supports other private destinations, but the service must be bound explicitly to the corresponding interface; it does not automatically open on Wi-Fi/LAN. A domain name or public IP address requires HTTPS and a secure proxy. The bridge's HTTP port `48720` must never be exposed directly to the Internet.
 
-### Independent Watch transport (pilot)
+### Independent Watch transport
 
-Build 0.7/29 enables an iPhone-independent path for text commands through an
-end-to-end encrypted, blind HTTPS mailbox with outbound-only connections from
-Watch and Mac. It preserves the same command UUID and still terminates in Relay's
-loopback Controller. The iPhone route remains the fallback. The protocol, threat
-boundary, live validation and rollback are documented in
+Build 0.8/44 adds autonomous first-run pairing to the iPhone-independent,
+end-to-end encrypted blind HTTPS mailbox. Watch and Mac discover one another
+through a 15-minute iCloud Keychain offer and require a matching six-digit code;
+the normal mailbox still uses outbound-only HTTPS, preserves command UUIDs and
+terminates in Relay's loopback Controller. The iPhone route remains the fallback.
+The protocol, threat boundary, live validation and rollback are documented in
 [Independent Watch transport](docs/HTTPS-MAILBOX-TRANSPORT.md).
 
 ## Security controls

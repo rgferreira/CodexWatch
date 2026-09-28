@@ -20,6 +20,11 @@ xcrun swiftc Shared/CodexModels.swift Shared/CloudRelayProtocol.swift \
   Tests/CloudRelayProtocolValidation.swift -o "$validation_dir/protocol"
 "$validation_dir/protocol"
 
+xcrun swiftc Shared/CodexModels.swift Shared/CloudRelayProtocol.swift \
+  Shared/CloudRelayPairing.swift Tests/StandalonePairingValidation.swift \
+  -o "$validation_dir/standalone-pairing"
+"$validation_dir/standalone-pairing"
+
 xcrun swiftc Shared/CodexModels.swift Tests/PendingTextCommandOutboxValidation.swift \
   -o "$validation_dir/pending-command-outbox"
 "$validation_dir/pending-command-outbox"

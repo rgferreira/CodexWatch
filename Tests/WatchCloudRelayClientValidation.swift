@@ -5,12 +5,15 @@ actor WatchAckFailingTransport: BlindMailboxTransport {
     private var claimValues: [BlindMailboxHTTPClient.ClaimedEnvelope]
     private var acknowledgmentAttempts = 0
     private var acknowledgmentStarted = false
+    private var published: [CloudRelayProtocol.SealedEnvelope] = []
 
     init(claims: [BlindMailboxHTTPClient.ClaimedEnvelope]) {
         claimValues = claims
     }
 
-    func put(_ envelope: CloudRelayProtocol.SealedEnvelope) async throws {}
+    func put(_ envelope: CloudRelayProtocol.SealedEnvelope) async throws {
+        published.append(envelope)
+    }
 
     func claim(
         direction: CloudRelayProtocol.Direction,
@@ -34,6 +37,7 @@ actor WatchAckFailingTransport: BlindMailboxTransport {
 
     func attempts() -> Int { acknowledgmentAttempts }
     func started() -> Bool { acknowledgmentStarted }
+    func publishedEnvelopes() -> [CloudRelayProtocol.SealedEnvelope] { published }
 }
 
 @main
@@ -105,6 +109,33 @@ struct WatchCloudRelayClientValidation {
         precondition(acknowledgmentStarted)
         let acknowledgmentAttempts = await transport.attempts()
         precondition(acknowledgmentAttempts == 3)
+
+        let settingsRequestID = UUID()
+        try await client.requestVoiceSettings(requestID: settingsRequestID)
+        let updatedConfiguration = VoiceConfiguration(
+            inputMode: .openAIAPI,
+            transcriptionModel: .gpt4oTranscribe,
+            updatedAt: Date()
+        )
+        let settingsUpdateID = UUID()
+        try await client.updateVoiceSettings(
+            requestID: settingsUpdateID,
+            configuration: updatedConfiguration
+        )
+        let published = await transport.publishedEnvelopes()
+        precondition(published.count == 2)
+        let requestPayload = try CloudRelayProtocol.open(
+            published[0], expectedDirection: .watchToMac, key: key
+        )
+        precondition(requestPayload.commandID == settingsRequestID)
+        precondition(requestPayload.operation == .voiceSettingsRequest)
+        let updatePayload = try CloudRelayProtocol.open(
+            published[1], expectedDirection: .watchToMac, key: key
+        )
+        let update = try updatePayload.decode(CloudVoiceSettingsUpdate.self)
+        precondition(update.requestID == settingsUpdateID)
+        precondition(update.configuration.inputMode == .openAIAPI)
+        precondition(update.configuration.transcriptionModel == .gpt4oTranscribe)
         print("Three Watch conversations bypass hanging ACKs")
     }
 }
