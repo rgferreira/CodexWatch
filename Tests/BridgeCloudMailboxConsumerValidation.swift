@@ -127,6 +127,7 @@ struct BridgeCloudMailboxConsumerValidation {
             )
         ]
         let command = CodexCommand(task: task, text: "Queue this once")
+        let newTask = NewTaskCommand(prompt: "Create and finish once", projectPath: nil)
         let request = try CloudRelayProtocol.seal(
             payload: try .init(
                 commandID: command.id,
@@ -153,6 +154,10 @@ struct BridgeCloudMailboxConsumerValidation {
                 precondition(received.id == command.id)
                 return .queued("Accepted by Controller")
             },
+            createTask: { received in
+                precondition(received.id == newTask.id)
+                return .queued("Task accepted by Controller")
+            },
             listTasks: { [task] },
             listProjects: { projects },
             readConversation: { threadID in
@@ -172,7 +177,13 @@ struct BridgeCloudMailboxConsumerValidation {
             voiceInbox: try CloudVoiceInbox(
                 root: directory.appendingPathComponent("voice", isDirectory: true)
             ),
-            operationStatus: { _ in await statuses.get() },
+            operationStatus: { operationID in
+                precondition([
+                    "codex-watch:\(command.id.uuidString)",
+                    "codex-watch:new:\(newTask.id.uuidString)"
+                ].contains(operationID))
+                return await statuses.get()
+            },
             heartbeat: { _ in await heartbeats.markReceived() },
             getVoiceConfiguration: { await voiceConfiguration.get() },
             updateVoiceConfiguration: { candidate in
@@ -205,6 +216,48 @@ struct BridgeCloudMailboxConsumerValidation {
         precondition(terminalReceipt.state == .sent)
         let finalOutbox = await outbox.pending()
         precondition(finalOutbox.isEmpty)
+
+        let createRequest = try CloudRelayProtocol.seal(
+            payload: try .init(
+                commandID: newTask.id,
+                operation: .newTaskCommand,
+                body: newTask
+            ),
+            pairingID: pairingID,
+            direction: .watchToMac,
+            key: watchKey
+        )
+        await transport.seed(.init(
+            recordID: createRequest.context.recordName,
+            envelope: createRequest,
+            leaseToken: "lease-create",
+            leaseExpiresAt: Date().addingTimeInterval(90)
+        ))
+        await statuses.set("handoff_in_progress")
+        let drainedCreation = try await consumer.drainOnce(waitSeconds: 0)
+        precondition(drainedCreation)
+        let afterCreate = await transport.snapshot()
+        precondition(afterCreate.acknowledged.contains(createRequest.context.recordName))
+        let acceptedCreation = try CloudRelayProtocol.open(
+            afterCreate.published.last!, expectedDirection: .macToWatch, key: watchKey
+        )
+        let acceptedCreationReceipt = try acceptedCreation.decode(CommandReceipt.self)
+        precondition(acceptedCreationReceipt.state == .queued)
+        let pendingCreation = await outbox.pending()
+        precondition(pendingCreation.map(\.operationID) == ["codex-watch:new:\(newTask.id.uuidString)"])
+        try await consumer.reconcileOutbox()
+        let stillPendingCreation = await outbox.pending()
+        precondition(stillPendingCreation.count == 1)
+        await statuses.set("completed")
+        try await consumer.reconcileOutbox()
+        let afterCreateTerminal = await transport.snapshot()
+        let finishedCreation = try CloudRelayProtocol.open(
+            afterCreateTerminal.published.last!, expectedDirection: .macToWatch, key: watchKey
+        )
+        let finishedCreationReceipt = try finishedCreation.decode(CommandReceipt.self)
+        precondition(finishedCreationReceipt.state == .sent)
+        let completedCreationOutbox = await outbox.pending()
+        precondition(completedCreationOutbox.isEmpty)
 
         let taskRequestID = UUID()
         let taskRequest = try CloudRelayProtocol.seal(

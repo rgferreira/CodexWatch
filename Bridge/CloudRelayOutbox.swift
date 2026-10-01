@@ -47,8 +47,13 @@ actor CloudRelayOutbox {
         }
     }
 
-    func recordQueued(pairingID: String, commandID: UUID, now: Date = Date()) throws {
-        let operationID = "codex-watch:\(commandID.uuidString)"
+    func recordQueued(
+        pairingID: String,
+        commandID: UUID,
+        isNewTask: Bool = false,
+        now: Date = Date()
+    ) throws {
+        let operationID = "codex-watch:\(isNewTask ? "new:" : "")\(commandID.uuidString)"
         guard operationID.count <= 240, pairingID.count <= 128 else {
             throw OutboxError.unsafeOperationID
         }

@@ -17,7 +17,7 @@ actor BridgeCloudMailboxConsumer {
     typealias ListProjects = @Sendable () async throws -> [CodexProject]
     typealias ReadConversation = @Sendable (String) async throws -> [CodexMessage]
     typealias DeliverVoice = @Sendable (CodexVoiceCommand, Data) async -> DeliveryOutcome
-    typealias OperationStatus = @Sendable (UUID) async throws -> String
+    typealias OperationStatus = @Sendable (String) async throws -> String
     typealias Heartbeat = @Sendable (Date) async -> Void
     typealias GetVoiceConfiguration = @Sendable () async -> VoiceConfiguration
     typealias UpdateVoiceConfiguration = @Sendable (VoiceConfiguration) async -> VoiceConfiguration
@@ -358,9 +358,11 @@ actor BridgeCloudMailboxConsumer {
             )
             try await acknowledge(claim)
         case .queued(let message):
-            if operation == "text-write" {
-                try await outbox.recordQueued(pairingID: pairingID, commandID: commandID)
-            }
+            try await outbox.recordQueued(
+                pairingID: pairingID,
+                commandID: commandID,
+                isNewTask: operation == "create"
+            )
             try await publishReceipt(
                 CommandReceipt(commandID: commandID, state: .queued, message: message)
             )
@@ -528,28 +530,31 @@ actor BridgeCloudMailboxConsumer {
     func reconcileOutbox() async throws {
         for entry in await outbox.pending() {
             let status: String
-            do { status = try await operationStatus(entry.commandID) }
+            do { status = try await operationStatus(entry.operationID) }
             catch { continue }
             switch status {
-            case "queued", "running":
+            case "queued", "running", "waiting_for_writer", "handoff_accepted",
+                 "handoff_in_progress", "processing":
                 continue
             case "completed":
                 try await outbox.markTerminalPending(operationID: entry.operationID)
                 try await publishReceipt(CommandReceipt(
                     commandID: entry.commandID,
                     state: .sent,
-                    message: "Orden completada por Relay"
+                    message: entry.operationID.hasPrefix("codex-watch:new:")
+                        ? "Tarea completada" : "Orden completada por Relay"
                 ))
                 try await outbox.remove(operationID: entry.operationID)
-            case "failed", "cancelled":
+            case "failed", "cancelled", "handoff_failed":
                 try await outbox.markTerminalPending(operationID: entry.operationID)
                 try await publishReceipt(CommandReceipt(
                     commandID: entry.commandID,
                     state: .failed,
-                    message: "Relay no pudo completar la orden aceptada"
+                    message: entry.operationID.hasPrefix("codex-watch:new:")
+                        ? "Codex no pudo completar la tarea" : "Relay no pudo completar la orden aceptada"
                 ))
                 try await outbox.remove(operationID: entry.operationID)
-            case "unknown", "conflict":
+            case "unknown", "conflict", "handoff_unknown":
                 try await outbox.markTerminalPending(operationID: entry.operationID)
                 try await publishReceipt(CommandReceipt(
                     commandID: entry.commandID,

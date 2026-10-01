@@ -8,6 +8,10 @@ final class CodexAppServerClient: @unchecked Sendable {
         case completed
         case queued
     }
+    struct TaskCreationResult {
+        let threadID: String
+        let disposition: SubmissionDisposition
+    }
     private let baseURL = URL(string: "http://127.0.0.1:48721")!
     private let tokenURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/Relay/controller-token")
@@ -98,14 +102,25 @@ final class CodexAppServerClient: @unchecked Sendable {
     }
 
     func operationStatus(for commandID: UUID) async throws -> String {
+        try await operationStatus(operationID: "codex-watch:\(commandID.uuidString)")
+    }
+
+    func operationStatus(operationID: String) async throws -> String {
+        let prefix = operationID.hasPrefix("codex-watch:new:")
+            ? "codex-watch:new:" : "codex-watch:"
+        guard operationID.hasPrefix(prefix),
+              let identifier = UUID(uuidString: String(operationID.dropFirst(prefix.count))),
+              operationID == "\(prefix)\(identifier.uuidString)" else {
+            throw makeError("Operation ID de CodexWatch no válido")
+        }
         let result = try await request(
-            path: "/v1/operations/codex-watch:\(commandID.uuidString)",
+            path: "/v1/operations/\(operationID)",
             method: "GET"
         )
         return result["status"] as? String ?? "unknown"
     }
 
-    func createTask(_ command: NewTaskCommand) async throws -> String {
+    func createTask(_ command: NewTaskCommand) async throws -> TaskCreationResult {
         let prompt = command.prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty, prompt.count <= 12_000 else {
             throw makeError("La petición debe tener entre 1 y 12.000 caracteres")
@@ -131,12 +146,19 @@ final class CodexAppServerClient: @unchecked Sendable {
             payload: payload,
             timeout: 30 * 60 + 30
         )
-        guard result["status"] as? String == "completed",
-              let threadID = result["thread_id"] as? String,
+        return try taskCreationResult(from: result)
+    }
+
+    func taskCreationResult(from result: [String: Any]) throws -> TaskCreationResult {
+        guard let threadID = result["thread_id"] as? String,
               !threadID.isEmpty else {
             throw makeError("Relay no confirmó la nueva tarea")
         }
-        return threadID
+        switch result["status"] as? String {
+        case "completed": return TaskCreationResult(threadID: threadID, disposition: .completed)
+        case "queued": return TaskCreationResult(threadID: threadID, disposition: .queued)
+        default: throw makeError("Relay devolvió un estado de creación desconocido")
+        }
     }
 
     func recentMessages(threadID: String, limit: Int = 6) async throws -> [CodexMessage] {

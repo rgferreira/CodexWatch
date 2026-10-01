@@ -490,10 +490,15 @@ final class BridgeController: ObservableObject {
 
         if request.method == "GET", request.path.hasPrefix("/commands/") {
             let rawID = String(request.path.dropFirst("/commands/".count))
-            guard let commandID = UUID(uuidString: rawID),
-                  let receipt = commandReceipts[commandID] else {
-                return .notFound
+            guard let commandID = UUID(uuidString: rawID) else { return .notFound }
+            if let receipt = commandReceipts[commandID], receipt.state != .queued {
+                return .encodable(receipt)
             }
+            if let receipt = await reconcileCommandReceipt(commandID) {
+                remember(receipt)
+                return .encodable(receipt)
+            }
+            guard let receipt = commandReceipts[commandID] else { return .notFound }
             return .encodable(receipt)
         }
 
@@ -535,16 +540,23 @@ final class BridgeController: ObservableObject {
                         userInfo: [NSLocalizedDescriptionKey: "El proyecto seleccionado ya no está disponible"]
                     )
                 }
-                _ = try await appServer.createTask(command)
-                let receipt = CommandReceipt(
-                    commandID: command.id,
-                    state: .sent,
-                    message: "Tarea creada"
-                )
+                let created = try await appServer.createTask(command)
+                let receipt: CommandReceipt
+                switch created.disposition {
+                case .completed:
+                    receipt = CommandReceipt(commandID: command.id, state: .sent, message: "Tarea creada")
+                case .queued:
+                    receipt = CommandReceipt(commandID: command.id, state: .queued, message: "Tarea creada; Codex está trabajando")
+                }
                 operationSafety.finishWrite(threadID: operationThread, receipt: receipt)
-                telemetry(correlationID, threadID: operationThread, operation: "create", origin: origin(for: request), result: "success", duration: Date().timeIntervalSince(started))
+                telemetry(correlationID, threadID: operationThread, operation: "create", origin: origin(for: request), result: receipt.state == .sent ? "success" : "queued", duration: Date().timeIntervalSince(started))
                 remember(receipt)
                 await refreshTasks()
+                if receipt.state == .queued {
+                    Task { [weak self] in
+                        await self?.monitorQueuedNewTask(command.id)
+                    }
+                }
                 return .encodable(receipt)
             } catch {
                 Self.logger.error("No se pudo crear una tarea: \(error.localizedDescription, privacy: .private)")
@@ -805,6 +817,61 @@ final class BridgeController: ObservableObject {
         }
     }
 
+    private func monitorQueuedNewTask(_ commandID: UUID) async {
+        let operationID = "codex-watch:new:\(commandID.uuidString)"
+        for _ in 0..<360 {
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            guard !Task.isCancelled else { return }
+            do {
+                let status = try await appServer.operationStatus(operationID: operationID)
+                let receipt: CommandReceipt
+                switch status {
+                case "completed":
+                    receipt = CommandReceipt(commandID: commandID, state: .sent, message: "Tarea completada")
+                case "failed", "cancelled", "handoff_failed":
+                    receipt = CommandReceipt(commandID: commandID, state: .failed, message: "Codex no pudo completar la tarea")
+                case "unknown", "conflict", "handoff_unknown":
+                    receipt = CommandReceipt(commandID: commandID, state: .failed, message: "La tarea requiere conciliación en el Mac")
+                default:
+                    continue
+                }
+                remember(receipt)
+                if receipt.state == .sent { await refreshTasks() }
+                return
+            } catch {
+                continue
+            }
+        }
+    }
+
+    private func reconcileCommandReceipt(_ commandID: UUID) async -> CommandReceipt? {
+        let newTaskOperationID = "codex-watch:new:\(commandID.uuidString)"
+        let textOperationID = "codex-watch:\(commandID.uuidString)"
+        for (operationID, isNewTask) in [(newTaskOperationID, true), (textOperationID, false)] {
+            guard let status = try? await appServer.operationStatus(operationID: operationID) else {
+                continue
+            }
+            let state: CommandReceipt.State
+            let message: String
+            switch status {
+            case "completed":
+                state = .sent
+                message = isNewTask ? "Tarea completada" : "Orden completada"
+            case "failed", "cancelled", "handoff_failed":
+                state = .failed
+                message = isNewTask ? "Codex no pudo completar la tarea" : "Relay no pudo completar la orden"
+            case "unknown", "conflict", "handoff_unknown":
+                state = .failed
+                message = "La operación requiere conciliación en el Mac"
+            default:
+                state = .queued
+                message = isNewTask ? "Tarea creada; Codex está trabajando" : "Orden aceptada; procesando"
+            }
+            return CommandReceipt(commandID: commandID, state: state, message: message)
+        }
+        return nil
+    }
+
     private func telemetryResult(for error: Error) -> String {
         if error is CancellationError { return "cancelled" }
         if (error as? URLError)?.code == .timedOut { return "timeout" }
@@ -1063,7 +1130,7 @@ final class BridgeController: ObservableObject {
                 },
                 operationStatus: { [weak self] commandID in
                     guard let self else { throw CancellationError() }
-                    return try await self.appServer.operationStatus(for: commandID)
+                    return try await self.appServer.operationStatus(operationID: commandID)
                 },
                 heartbeat: { [weak self] _ in
                     await self?.recordCloudHeartbeat()
@@ -1221,15 +1288,23 @@ final class BridgeController: ObservableObject {
                     userInfo: [NSLocalizedDescriptionKey: "El proyecto seleccionado ya no está disponible"]
                 )
             }
-            _ = try await appServer.createTask(command)
-            let receipt = CommandReceipt(
-                commandID: command.id,
-                state: .sent,
-                message: "Tarea creada"
-            )
+            let created = try await appServer.createTask(command)
+            let receipt: CommandReceipt
+            switch created.disposition {
+            case .completed:
+                receipt = CommandReceipt(commandID: command.id, state: .sent, message: "Tarea creada")
+            case .queued:
+                receipt = CommandReceipt(commandID: command.id, state: .queued, message: "Tarea creada; Codex está trabajando")
+            }
             operationSafety.finishWrite(threadID: thread, receipt: receipt)
             remember(receipt)
             _ = try? await cloudTasksSnapshot()
+            if receipt.state == .queued {
+                Task { [weak self] in
+                    await self?.monitorQueuedNewTask(command.id)
+                }
+                return .queued(receipt.message)
+            }
             return .completed(receipt.message)
         } catch {
             let receipt = CommandReceipt(

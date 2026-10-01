@@ -1,5 +1,15 @@
 # Changelog
 
+## Mac Bridge hotfix — build 46 (2026-10-01)
+
+- Accepts Relay's durable `queued` response when the Watch creates a task.
+  The previous Bridge falsely reported failure even though Codex was already
+  executing the task.
+- Tracks new-task operations by their exact `codex-watch:new:<UUID>` identity
+  in the restart-safe receipt outbox and sends the terminal result to the Watch.
+- Keeps the iPhone-mediated creation path consistent with the same operation
+  lifecycle. The iPhone and Watch apps remain on build 45.
+
 ## v0.8.1 — build 45 (2026-09-25)
 
 - Never removes a text command from the Watch outbox because of a transient

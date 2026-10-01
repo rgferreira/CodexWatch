@@ -12,6 +12,15 @@ struct CloudRelayOutboxValidation {
         let firstPending = await first.pending()
         precondition(firstPending.count == 1)
         precondition(firstPending[0].operationID == "codex-watch:\(commandID.uuidString)")
+        let newTaskID = UUID()
+        try await first.recordQueued(
+            pairingID: "pairing", commandID: newTaskID, isNewTask: true
+        )
+        let bothKinds = await first.pending()
+        precondition(bothKinds.map(\.operationID).contains(
+            "codex-watch:new:\(newTaskID.uuidString)"
+        ))
+        try await first.remove(operationID: "codex-watch:new:\(newTaskID.uuidString)")
 
         let restarted = try CloudRelayOutbox(fileURL: url)
         let afterRestart = await restarted.pending()

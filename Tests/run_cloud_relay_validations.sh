@@ -38,6 +38,10 @@ xcrun swiftc Shared/CodexModels.swift Bridge/CloudRelayOutbox.swift \
   Tests/CloudRelayOutboxValidation.swift -o "$validation_dir/outbox"
 "$validation_dir/outbox"
 
+xcrun swiftc Shared/CodexModels.swift Bridge/CodexAppServerClient.swift \
+  Tests/CodexControllerClientValidation.swift -o "$validation_dir/controller-client"
+"$validation_dir/controller-client"
+
 xcrun swiftc Shared/CodexModels.swift Shared/CloudRelayProtocol.swift \
   Shared/BlindMailboxHTTPClient.swift Bridge/CloudRelayOutbox.swift \
   Bridge/CloudVoiceInbox.swift Bridge/BridgeCloudMailboxConsumer.swift \
