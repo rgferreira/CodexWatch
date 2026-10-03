@@ -1,4 +1,5 @@
 import SwiftUI
+import OSLog
 import WatchConnectivity
 import WatchKit
 
@@ -222,9 +223,14 @@ struct TaskPickerView: View {
         if relay.tasks.isEmpty {
           VStack(spacing: 8) {
             CloudTransportStatusView()
-            ContentUnavailableView(
-              "Sin tareas", systemImage: "tray",
-              description: Text(relay.taskRefreshError ?? "Actualizando desde Codex…"))
+            if !relay.hasConfirmedTasks, relay.taskRefreshError == nil {
+              ProgressView("Cargando tareas…")
+            } else {
+              ContentUnavailableView(
+                relay.hasConfirmedTasks ? "Sin tareas" : "No se pudieron cargar las tareas",
+                systemImage: "tray",
+                description: Text(relay.taskRefreshError ?? "No hay tareas recientes en Codex"))
+            }
             Button { isConfiguringVoice = true } label: {
               Label("Voz y transcripción", systemImage: "waveform")
             }
@@ -233,8 +239,24 @@ struct TaskPickerView: View {
         } else {
           List {
             CloudTransportStatusView()
-            if let error = relay.taskRefreshError {
+            if let error = relay.taskRefreshError,
+              TaskListSyncPolicy.isStale(lastUpdatedAt: relay.lastTasksUpdatedAt) {
               Label(error, systemImage: "exclamationmark.triangle")
+                .font(.caption2)
+                .foregroundStyle(.orange)
+            }
+            if let refreshedAt = relay.lastTasksUpdatedAt {
+              if TaskListSyncPolicy.isStale(lastUpdatedAt: refreshedAt) {
+                Label {
+                  Text("Lista sin actualizar · ") + Text(refreshedAt, style: .relative)
+                } icon: {
+                  Image(systemName: "clock.badge.exclamationmark")
+                }
+                .font(.caption2)
+                .foregroundStyle(.orange)
+              }
+            } else {
+              Label("Lista pendiente de actualización", systemImage: "clock.badge.exclamationmark")
                 .font(.caption2)
                 .foregroundStyle(.orange)
             }
@@ -368,14 +390,20 @@ private struct CloudTransportStatusView: View {
   @EnvironmentObject private var relay: WatchRelay
 
   var body: some View {
+    let tasksAreFresh = !TaskListSyncPolicy.isStale(
+      lastUpdatedAt: relay.lastDirectTasksUpdatedAt
+    ) && !TaskListSyncPolicy.isStale(lastUpdatedAt: relay.lastTasksUpdatedAt)
+    let directReadReady = relay.isCloudTransportActive && relay.hasConfirmedTasks && tasksAreFresh
     Label(
-      relay.cloudTransportStatus,
-      systemImage: relay.isCloudTransportActive ? "cloud.fill" : "cloud.slash.fill"
+      directReadReady ? "Conexión directa activa" :
+        (relay.isCloudTransportActive ? "HTTPS activo · tareas sin confirmar" : relay.cloudTransportStatus),
+      systemImage: directReadReady ? "cloud.fill" : "cloud.slash.fill"
     )
     .font(.caption2)
-    .foregroundStyle(relay.isCloudTransportActive ? .green : .orange)
+    .foregroundStyle(directReadReady ? .green : .orange)
     .lineLimit(2)
-    .accessibilityLabel("Conexión directa: \(relay.cloudTransportStatus)")
+    .accessibilityLabel(directReadReady ? "Conexión directa y tareas actualizadas" :
+      "Conexión directa sin actualización de tareas confirmada")
   }
 }
 
@@ -948,6 +976,7 @@ private struct CachedConversation: Codable {
 @MainActor
 final class WatchRelay: NSObject, ObservableObject {
   static let shared = WatchRelay()
+  private static let logger = Logger(subsystem: "com.rgferreira.CodexWatch", category: "TaskSync")
   private static var isWatchOnlyBuild: Bool {
     Bundle.main.object(forInfoDictionaryKey: "WKWatchOnly") as? Bool == true
   }
@@ -958,6 +987,10 @@ final class WatchRelay: NSObject, ObservableObject {
   @Published private(set) var conversationErrors: [String: String] = [:]
   @Published private(set) var isRefreshingTasks = false
   @Published private(set) var taskRefreshError: String?
+  @Published private(set) var hasConfirmedTasks = false
+  @Published private(set) var lastTasksUpdatedAt =
+    UserDefaults.standard.object(forKey: "lastTasksUpdatedAt") as? Date
+  @Published private(set) var lastDirectTasksUpdatedAt: Date?
   @Published private(set) var commandReceipts: [UUID: CommandReceipt] = [:]
   @Published private(set) var voiceInputMode: VoiceInputMode = .watchDictation
   @Published private(set) var transcriptionModel: OpenAITranscriptionModel = .gptTranscribe
@@ -978,6 +1011,9 @@ final class WatchRelay: NSObject, ObservableObject {
   private var standalonePairingTask: Task<Void, Never>?
   private var activeTaskRefreshID: UUID?
   private var pendingTaskRequestID: UUID?
+  private var nextTaskRequestGeneration: UInt64 = 0
+  private var taskRequestGenerations: [UUID: UInt64] = [:]
+  private var lastAppliedTaskRequestGeneration: UInt64 = 0
   private var pendingProjectRequestID: UUID?
   private var taskRefreshTimeoutTask: Task<Void, Never>?
   private var pendingConversationRequests: [UUID: (taskID: String, revision: Date)] = [:]
@@ -994,6 +1030,25 @@ final class WatchRelay: NSObject, ObservableObject {
   private var pendingCommandRetryAt: [UUID: Date] = [:]
   private var textCommandUploadsInFlight: Set<UUID> = []
   private var voiceConfigurationUpdatedAt = Date.distantPast
+  private static let taskSyncTraceKey = "taskSyncTrace"
+
+  private func traceTaskSync(_ event: String, requestID: UUID? = nil) {
+    let timestamp = ISO8601DateFormatter().string(from: Date())
+    let shortID = requestID.map { String($0.uuidString.prefix(8)) } ?? "-"
+    var trace = UserDefaults.standard.stringArray(forKey: Self.taskSyncTraceKey) ?? []
+    trace.append("\(timestamp) \(event) \(shortID)")
+    UserDefaults.standard.set(Array(trace.suffix(40)), forKey: Self.taskSyncTraceKey)
+  }
+
+  private static func taskSyncErrorCode(_ error: Error) -> String {
+    if let transport = error as? BlindMailboxHTTPClient.ClientError {
+      return transport.telemetryCode
+    }
+    if let network = error as? URLError {
+      return "url_\(network.code.rawValue)"
+    }
+    return String(describing: type(of: error))
+  }
 
   var shouldUseWatchDictation: Bool {
     voiceInputMode == .watchDictation
@@ -1440,6 +1495,7 @@ final class WatchRelay: NSObject, ObservableObject {
       finishTaskRefreshAttempt()
     }
     let requestID = UUID()
+    traceTaskSync("refresh_start", requestID: requestID)
     activeTaskRefreshID = requestID
     isRefreshingTasks = true
     taskRefreshError = nil
@@ -1454,13 +1510,21 @@ final class WatchRelay: NSObject, ObservableObject {
     if let cloudClient {
       startCloudReceiveLoop(cloudClient)
       pendingTaskRequestID = requestID
+      nextTaskRequestGeneration += 1
+      taskRequestGenerations[requestID] = nextTaskRequestGeneration
+      taskRequestGenerations = taskRequestGenerations.filter {
+        $0.value > lastAppliedTaskRequestGeneration &&
+          nextTaskRequestGeneration - $0.value <= 16
+      }
       taskRefreshTimeoutTask = Task { [weak self] in
         do {
-          try await Task.sleep(for: .seconds(15))
+          try await Task.sleep(for: .seconds(60))
         } catch {
           return
         }
         guard let self, activeTaskRefreshID == requestID else { return }
+        Self.logger.warning("task-list request=\(requestID.uuidString, privacy: .public) result=timeout")
+        traceTaskSync("refresh_timeout", requestID: requestID)
         pendingTaskRequestID = nil
         taskRefreshTimeoutTask = nil
         if companionReachable {
@@ -1476,8 +1540,10 @@ final class WatchRelay: NSObject, ObservableObject {
       Task { [weak self] in
         do {
           try await cloudClient.requestTasks(requestID: requestID)
+          self?.traceTaskSync("upload_ok", requestID: requestID)
         } catch {
           guard let self, activeTaskRefreshID == requestID else { return }
+          traceTaskSync("upload_\(Self.taskSyncErrorCode(error))", requestID: requestID)
           taskRefreshTimeoutTask?.cancel()
           taskRefreshTimeoutTask = nil
           pendingTaskRequestID = nil
@@ -1806,16 +1872,24 @@ final class WatchRelay: NSObject, ObservableObject {
   }
 
   private func applyTasks(_ data: Data, revision: TimeInterval?) {
+    guard TaskListSyncPolicy.acceptsCompanionRevision(
+      revision, latestRevision: latestTasksRevision
+    ) else { return }
     if let revision {
-      guard revision >= latestTasksRevision else { return }
       latestTasksRevision = revision
       UserDefaults.standard.set(revision, forKey: "latestTasksRevision")
-    } else if latestTasksRevision > 0 {
-      return
     }
     guard let decoded = try? CodexWatchWire.decode([CodexTask].self, from: data) else { return }
-    tasks = decoded.sorted { $0.updatedAt > $1.updatedAt }
+    storeTasks(decoded, refreshedAt: revision.map { Date(timeIntervalSince1970: $0) } ?? Date())
     finishTaskRefreshAttempt()
+  }
+
+  private func storeTasks(_ decoded: [CodexTask], refreshedAt: Date) {
+    tasks = decoded.sorted { $0.updatedAt > $1.updatedAt }
+    hasConfirmedTasks = true
+    let localRefreshAt = min(refreshedAt, Date())
+    lastTasksUpdatedAt = localRefreshAt
+    UserDefaults.standard.set(localRefreshAt, forKey: "lastTasksUpdatedAt")
     lastQueuedTaskRequest = nil
 
     if let mostRecentTask = tasks.first {
@@ -2147,6 +2221,7 @@ final class WatchRelay: NSObject, ObservableObject {
       cloudTransportStatus = "Conexión directa preparada"
       startCloudReceiveLoop(client)
       refreshVoiceSettings()
+      if !isRefreshingTasks { refreshTasks() }
     } catch {
       CloudRelayKeyStore.setActivePairingID(nil, role: "watch")
       cloudClient = nil
@@ -2195,6 +2270,7 @@ final class WatchRelay: NSObject, ObservableObject {
         } catch {
           consecutiveFailures += 1
           if let self {
+            traceTaskSync("receive_\(Self.taskSyncErrorCode(error))")
             let recentlyActive = lastCloudRoundTripAt.map {
               Date().timeIntervalSince($0) <= 90
             } ?? false
@@ -2220,10 +2296,32 @@ final class WatchRelay: NSObject, ObservableObject {
         setCommandReceipt(receipt)
       }
     case .tasks(let response):
-      guard activeTaskRefreshID == response.requestID,
-            pendingTaskRequestID == response.requestID,
-            let data = try? CodexWatchWire.encode(response.tasks) else { return }
-      applyTasks(data, revision: response.revision.timeIntervalSince1970)
+      traceTaskSync("response_received", requestID: response.requestID)
+      // The request ID, not clocks on three devices, establishes freshness.
+      // A response arriving after the UI timeout is still valid unless a
+      // newer cloud request superseded it.
+      guard let generation = taskRequestGenerations[response.requestID],
+        TaskListSyncPolicy.acceptsDirectResponse(
+          requestGeneration: generation,
+          lastAppliedGeneration: lastAppliedTaskRequestGeneration
+        ) else {
+        Self.logger.info("task-list request=\(response.requestID.uuidString, privacy: .public) result=superseded")
+        return
+      }
+      lastAppliedTaskRequestGeneration = generation
+      taskRequestGenerations = taskRequestGenerations.filter { $0.value > generation }
+      latestTasksRevision = max(latestTasksRevision, response.revision.timeIntervalSince1970)
+      UserDefaults.standard.set(latestTasksRevision, forKey: "latestTasksRevision")
+      storeTasks(response.tasks, refreshedAt: Date())
+      let directSyncAt = Date()
+      lastDirectTasksUpdatedAt = directSyncAt
+      if activeTaskRefreshID == response.requestID {
+        finishTaskRefreshAttempt(requestID: response.requestID)
+      } else {
+        taskRefreshError = nil
+      }
+      traceTaskSync("response_applied_\(response.tasks.count)", requestID: response.requestID)
+      Self.logger.info("task-list request=\(response.requestID.uuidString, privacy: .public) result=applied count=\(response.tasks.count)")
     case .projects(let response):
       guard pendingProjectRequestID == response.requestID,
             let data = try? CodexWatchWire.encode(response.projects) else { return }

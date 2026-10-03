@@ -1,5 +1,21 @@
 # Changelog
 
+## Task-list synchronization — Watch build 49 / Mac Bridge build 48 (2026-10-03)
+
+- The direct Watch task-list request now reads a fresh Controller snapshot
+  instead of returning the Bridge's potentially stale UI cache.
+- Watch responses are ordered by local request generation, rather than by
+  device clocks or whether the original request is still marked active. A
+  delayed response may still update the list unless a newer one was applied.
+- The Watch distinguishes loading and stale tasks from an empty list. Its
+  direct-connection label turns green only after a fresh task-list response in
+  the current session; the Mac menu-bar icon still indicates recent transport
+  contact, not task-list freshness.
+- Adds metadata-only local task-sync tracing and synchronization-policy tests.
+  The installed builds were smoke-tested with fresh tasks on the Watch, but
+  intermittent mailbox HTTP 429 responses were observed afterward. This is
+  not yet a new stable release.
+
 ## Mac Bridge hotfix — build 46 (2026-10-01)
 
 - Accepts Relay's durable `queued` response when the Watch creates a task.

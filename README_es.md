@@ -18,6 +18,11 @@ reintentan tras reconectar con su UUID original; una orden ya aceptada no vuelve
 a subirse. Consulta
 [CHANGELOG.md](CHANGELOG.md).
 
+Las últimas builds de desarrollo instaladas son **Watch 49** y **Bridge del Mac
+48** (2026-10-03). Mejoran la sincronización de tareas, pero aún no se han
+promocionado a una nueva versión estable. La firma de desarrollo puede caducar;
+no son una distribución de App Store/TestFlight.
+
 ## Verlo en acción
 
 <p align="center"><img src="docs/assets/codexwatch-demo.gif" alt="Demostración de un minuto de Codex Watch" width="360"></p>
@@ -35,9 +40,9 @@ a subirse. Consulta
 
 El puente detecta ZeroTier y vincula el listener exclusivamente a esa IPv4 y su CIDR. Exige el token de acceso mostrado por la aplicación de macOS y no publica Bonjour.
 
-El icono de la barra de menús representa la conexión extremo a extremo: verde únicamente después de una respuesta autenticada reciente al Companion del iPhone, naranja cuando Codex y el puente están preparados pero no hay contacto reciente con el iPhone, y rojo si falla cualquiera de los servicios locales. El contacto verde caduca tras 45 segundos sin una nueva respuesta satisfactoria. El reloj conserva localmente los últimos mensajes de las conversaciones consultadas y los muestra inmediatamente al abrir una tarea. El puente lee de forma acotada el final del historial local, por lo que una conversación grande no obliga a reconstruirla completa. Solo vuelve a solicitar una conversación cuando la marca `updatedAt` de la lista anuncia información nueva; la actualización ocurre en segundo plano sin ocultar los mensajes ni alterar la posición de lectura.
+El icono de la barra de menús refleja el contacto autenticado reciente del Companion del iPhone o de la ruta HTTPS directa del Watch: verde si hubo contacto durante los últimos 45 segundos, naranja si los servicios locales están listos pero no hubo contacto reciente de ninguno de los dos, y rojo si falla un servicio local necesario. El verde confirma contacto de transporte, no que la lista de tareas esté actualizada. El reloj conserva localmente los últimos mensajes de las conversaciones consultadas y los muestra inmediatamente al abrir una tarea. El puente lee de forma acotada el final del historial local, por lo que una conversación grande no obliga a reconstruirla completa. Solo vuelve a solicitar una conversación cuando la marca `updatedAt` de la lista anuncia información nueva; la actualización ocurre en segundo plano sin ocultar los mensajes ni alterar la posición de lectura.
 
-La lista del Watch pide una copia fresca al abrirse y cada 10 segundos mientras permanece visible. La petición de WatchConnectivity despierta a la app compañera del iPhone, que consulta el bridge y responde directamente al reloj; además, el iPhone actualiza su copia cada 15 segundos mientras la app puede ejecutarse. Cada cambio se envía también como instantánea persistente, versionada y deduplicada: el reloj recibe la lista más nueva aunque el mensaje inmediato falle y descarta entregas antiguas. El iPhone conserva la última lista válida para no borrar el reloj con una caché vacía al reactivarse en segundo plano.
+El Watch solicita una instantánea de tareas al abrir la lista y cada 30 segundos mientras esa pantalla permanezca visible. En la build independiente, el buzón HTTPS cifrado lleva la petición al Bridge del Mac, que lee una lista fresca del Controller de Relay; el Watch ordena las respuestas por secuencia y puede aplicar una respuesta tardía salvo que ya haya aplicado otra más reciente. El Watch indica carga o lista desactualizada en vez de dar por fresca la lista debido a un heartbeat de transporte. En la build emparejada, WatchConnectivity despierta al Companion del iPhone, que consulta el bridge y responde al Watch; el iPhone también actualiza su copia cada 15 segundos mientras puede ejecutarse. Los cambios del Companion se envían además como instantáneas persistentes y versionadas, y el iPhone conserva su última lista válida en lugar de sustituirla por una caché vacía.
 
 El icono `+` de la esquina superior de la lista permite crear una tarea nueva. El selector replica el catálogo local canónico y los nombres visibles de Codex Desktop, incluidos los proyectos sin tareas recientes, con una sola fila por identidad de proyecto y no por carpeta. El reloj permite elegir un proyecto o ninguno, recoge la petición mediante dictado y envía al Controller de Relay una única operación de dominio idempotente usando el ID estable del proyecto.
 
@@ -83,7 +88,7 @@ La superficie y las limitaciones conocidas se documentan en [SECURITY.md](SECURI
 
 ## Puente del Mac
 
-La compilación activa puede instalarse en `~/Applications/CodexWatchBridge.app`. Un LaunchAgent local puede iniciarla al abrir sesión. Las actualizaciones deben conservar el mismo Team ID de firma para mantener el acceso no interactivo a las entradas existentes del llavero. El icono rojo indica que Codex o el servidor privado no están listos, el naranja que el Mac está preparado pero todavía no ha respondido recientemente al Companion, y el verde confirma una respuesta autenticada reciente al iPhone. El endpoint `/health` solo acepta orígenes de red privada y requiere el token.
+La compilación activa puede instalarse en `~/Applications/CodexWatchBridge.app`. Un LaunchAgent local puede iniciarla al abrir sesión. Las actualizaciones deben conservar el mismo Team ID de firma para mantener el acceso no interactivo a las entradas existentes del llavero. El icono refleja la disponibilidad de los servicios locales y el contacto autenticado reciente del iPhone o del Watch directo; no valida que la lista de tareas esté actualizada. El endpoint `/health` solo acepta orígenes de red privada y requiere el token.
 
 ## Seguridad de conversaciones
 

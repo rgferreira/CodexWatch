@@ -18,6 +18,11 @@ original UUID after reconnection; an accepted command is never uploaded again.
 See
 [CHANGELOG.md](CHANGELOG.md).
 
+The latest installed development builds are **Watch 49** and **Mac Bridge 48**
+(2026-10-03). They improve task-list synchronization but have not been promoted
+to a new stable release. Development signing can expire; these builds are not
+an App Store/TestFlight distribution.
+
 ## See it in action
 
 <p align="center"><img src="docs/assets/codexwatch-demo.gif" alt="Codex Watch one-minute demo" width="360"></p>
@@ -35,9 +40,9 @@ See
 
 The bridge detects ZeroTier and binds its listener exclusively to that IPv4 address and its CIDR. It requires the access token displayed by the macOS app and does not advertise through Bonjour.
 
-The menu bar icon reports end-to-end connection status: green only after a recent authenticated response to the iPhone Companion, orange when Codex and the bridge are ready but there has been no recent iPhone contact, and red if either local service fails. Green status expires after 45 seconds without another successful response. The Watch stores the latest messages from previously opened conversations and shows them immediately when a task is opened. The bridge reads a bounded tail of the local history, so a large conversation does not need to be reconstructed in full. It requests a conversation again only when the list's `updatedAt` marker signals new information; the refresh happens in the background without hiding messages or changing the reading position.
+The menu bar icon reports recent authenticated contact from either the iPhone Companion or the direct Watch HTTPS route: green with contact in the last 45 seconds, orange when local services are ready but neither device has contacted them recently, and red when a required local service is unavailable. Green indicates transport contact, not proof that the task list is current. The Watch stores the latest messages from previously opened conversations and shows them immediately when a task is opened. The bridge reads a bounded tail of the local history, so a large conversation does not need to be reconstructed in full. It requests a conversation again only when the list's `updatedAt` marker signals new information; the refresh happens in the background without hiding messages or changing the reading position.
 
-The Watch task list requests a fresh snapshot when opened and every 10 seconds while visible. The WatchConnectivity request wakes the iPhone companion, which queries the bridge and responds directly to the Watch; the iPhone also refreshes its copy every 15 seconds whenever the app can run. Every change is additionally sent as a persistent, versioned, and deduplicated snapshot: the Watch receives the newest list even if the immediate message fails and discards stale deliveries. The iPhone retains the last valid list so it cannot overwrite the Watch with an empty cache when resuming in the background.
+The Watch requests a task snapshot when its list opens and every 30 seconds while that screen remains visible. On the independent Watch build, the encrypted HTTPS mailbox carries the request to the Mac Bridge, which reads a fresh list from Relay's Controller; the Watch orders responses by request sequence and can apply a late response unless a newer one has already been applied. The Watch shows a loading or stale-list warning instead of treating a transport heartbeat as proof of fresh tasks. On the paired build, WatchConnectivity wakes the iPhone companion, which queries the bridge and responds to the Watch; the iPhone also refreshes its copy every 15 seconds whenever the app can run. Companion changes are additionally sent as persistent, versioned snapshots, and the iPhone retains its last valid list rather than replacing it with an empty cache.
 
 The `+` icon in the top corner of the task list creates a new task. Its picker mirrors the canonical local project catalog and visible names from Codex Desktop, including projects with no recent tasks, with one row per project identity rather than per folder. The Watch lets you choose a project or no project, collects the request through dictation, and submits one idempotent domain operation to Relay's Controller using the stable project ID.
 
@@ -82,7 +87,7 @@ The attack surface and known limitations are documented in [SECURITY.md](SECURIT
 
 ## Mac bridge
 
-The active build can be installed at `~/Applications/CodexWatchBridge.app`. A local LaunchAgent can start it at login. Upgrades must preserve the signing Team ID so existing Keychain entries remain available to background launches. A red icon means Codex or the private server is not ready, orange means the Mac is ready but has not responded to the Companion recently, and green confirms a recent authenticated response to the iPhone. The `/health` endpoint accepts private-network sources only and requires the token.
+The active build can be installed at `~/Applications/CodexWatchBridge.app`. A local LaunchAgent can start it at login. Upgrades must preserve the signing Team ID so existing Keychain entries remain available to background launches. The icon reflects local service readiness and recent authenticated contact from either the iPhone or the direct Watch route; it does not validate the freshness of the task list. The `/health` endpoint accepts private-network sources only and requires the token.
 
 ## Conversation safety
 

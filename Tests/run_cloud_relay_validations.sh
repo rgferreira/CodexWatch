@@ -16,6 +16,10 @@ trap cleanup EXIT INT TERM
 
 cd "$root_dir"
 
+xcrun swiftc Shared/TaskListSyncPolicy.swift \
+  Tests/TaskListSyncPolicyValidation.swift -o "$validation_dir/task-list-sync"
+"$validation_dir/task-list-sync"
+
 xcrun swiftc Shared/CodexModels.swift Shared/CloudRelayProtocol.swift \
   Tests/CloudRelayProtocolValidation.swift -o "$validation_dir/protocol"
 "$validation_dir/protocol"

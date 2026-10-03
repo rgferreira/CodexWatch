@@ -1233,21 +1233,16 @@ final class BridgeController: ObservableObject {
     }
 
     private func cloudTasksSnapshot() async throws -> [CodexTask] {
-        // The Bridge already owns the periodic Controller refresh. Serving the
-        // Watch from that read model keeps the single mailbox consumer free for
-        // conversation reads, commands and heartbeats instead of stacking a
-        // second expensive /v1/threads request every ten seconds.
-        if !hasLoadedTasks {
-            await refreshTasks()
-        }
-        guard hasLoadedTasks else {
-            throw NSError(
-                domain: "CodexWatch",
-                code: 5,
-                userInfo: [NSLocalizedDescriptionKey: "Las tareas todavía no están disponibles"]
-            )
-        }
-        return tasks
+        // A successful mailbox read must be a fresh Controller read. The
+        // periodic UI cache may remain populated after a failed refresh, so
+        // returning it here can silently show hours-old tasks while the
+        // transport heartbeat still reports a healthy connection.
+        let fresh = try await appServer.listTasks()
+        tasks = fresh
+        hasLoadedTasks = true
+        isCodexReady = true
+        updateReadiness()
+        return fresh
     }
 
     private func cloudProjectsSnapshot(forceRefresh: Bool = false) async throws -> [CodexProject] {
