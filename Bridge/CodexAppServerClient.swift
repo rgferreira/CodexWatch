@@ -186,7 +186,9 @@ final class CodexAppServerClient: @unchecked Sendable {
                 "telemetry_id": UUID().uuidString,
                 "operation_id": operationID,
                 "client_id": "codexwatch-bridge",
-                "phase": "watch_intent_fingerprint",
+                // API audio transcription creates its text command on Mac;
+                // an intent fingerprint alone must not imply Watch transcription.
+                "phase": "command_intent_fingerprint",
                 "observed_at": ISO8601DateFormatter().string(from: Date()),
                 "content_sha256": originDigest,
                 "content_bytes": originBytes

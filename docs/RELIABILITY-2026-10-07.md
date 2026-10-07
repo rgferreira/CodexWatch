@@ -24,7 +24,8 @@ This is not a new stable release or a claim of complete physical-device acceptan
 - Independent Swift transport suite: durable text/new-task outboxes, restart, duplicate tap, content mismatch, bounded concurrency, lease/ACK, retry safety, packaging and HTTP mock.
 - Relay regression suite: native creation, duplicate operation, lost start response, shutdown, crash between thread and turn, exact-turn read-only reconciliation, metadata privacy, notification idempotence/restart/network failure/quiet hours, History idempotence and stale-order expiry.
 - Real disposable native Controller creation: same operation submitted twice, one thread/turn, terminal completion after release; Desktop listing verified. No production reservation was repeated by this test.
-- Watch build 50 compiles and signs. Physical Watch installation and acceptance remain pending when the device is unavailable; the existing renewed build 49 must not be uninstalled to force this update.
+- Watch build 50 compiles, signs and is installed on the physical Watch. Its foreground launch was rejected because the device was locked (`FBSOpenApplicationErrorDomain` 7), not because installation failed. Launch and live Watch acceptance remain pending unlock; no uninstall was used.
+- Intent fingerprints verify the text command, not the transcription provider. API audio is transcribed on Mac and receives its fingerprint there; native Watch dictation/new-task text receives its fingerprint on Watch. Do not describe a generic intent fingerprint as proof of Watch-side transcription.
 
 ## Deployment and rollback
 
