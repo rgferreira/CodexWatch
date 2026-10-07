@@ -33,6 +33,14 @@ xcrun swiftc Shared/CodexModels.swift Tests/PendingTextCommandOutboxValidation.s
   -o "$validation_dir/pending-command-outbox"
 "$validation_dir/pending-command-outbox"
 
+xcrun swiftc Shared/CodexModels.swift Tests/PendingNewTaskOutboxValidation.swift \
+  -o "$validation_dir/pending-new-task-outbox"
+"$validation_dir/pending-new-task-outbox"
+
+xcrun swiftc Shared/CodexModels.swift Tests/OperationSafetyValidation.swift \
+  -o "$validation_dir/operation-safety"
+"$validation_dir/operation-safety"
+
 xcrun swiftc Shared/CodexModels.swift Shared/CloudRelayProtocol.swift \
   Shared/BlindMailboxState.swift Tests/BlindMailboxConcurrencyValidation.swift \
   -o "$validation_dir/concurrency"

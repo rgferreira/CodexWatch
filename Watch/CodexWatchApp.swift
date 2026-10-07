@@ -411,7 +411,7 @@ private struct NewTaskView: View {
   @EnvironmentObject private var relay: WatchRelay
   @Environment(\.dismiss) private var dismiss
 
-  @State private var prompt = ""
+  @AppStorage("newTaskDraftPrompt") private var prompt = ""
   @State private var projectSelection = ProjectSelectionState()
   @State private var commandID: UUID?
 
@@ -1025,8 +1025,10 @@ final class WatchRelay: NSObject, ObservableObject {
   private static let cachedConversationsKey = "cachedConversations"
   private static let cachedProjectsKey = "cachedProjects"
   private static let pendingTextCommandOutboxKey = "pendingTextCommandOutbox"
+  private static let pendingNewTaskOutboxKey = "pendingNewTaskOutbox"
   private static let voiceConfigurationKey = "standaloneVoiceConfiguration"
   private var pendingTextCommandOutbox = PendingTextCommandOutbox()
+  private var pendingNewTaskOutbox = PendingNewTaskOutbox()
   private var pendingCommandRetryAt: [UUID: Date] = [:]
   private var textCommandUploadsInFlight: Set<UUID> = []
   private var voiceConfigurationUpdatedAt = Date.distantPast
@@ -1067,6 +1069,12 @@ final class WatchRelay: NSObject, ObservableObject {
       commandReceipts = Dictionary(
         uniqueKeysWithValues: outbox.intents.map { ($0.command.id, $0.receipt) }
       )
+    }
+    if let data = UserDefaults.standard.data(forKey: Self.pendingNewTaskOutboxKey),
+      let restored = try? CodexWatchWire.decode(PendingNewTaskOutbox.self, from: data)
+    {
+      pendingNewTaskOutbox = restored
+      for intent in restored.intents { commandReceipts[intent.command.id] = intent.receipt }
     }
     if let data = UserDefaults.standard.data(forKey: Self.cachedConversationsKey),
       let cached = try? CodexWatchWire.decode([String: CachedConversation].self, from: data)
@@ -1293,7 +1301,8 @@ final class WatchRelay: NSObject, ObservableObject {
     }
   }
 
-  func createTask(_ command: NewTaskCommand) -> UUID {
+  func createTask(_ requested: NewTaskCommand) -> UUID {
+    let command = pendingNewTaskOutbox.matching(requested)?.command ?? requested
     commandReceipts[command.id] = CommandReceipt(
       commandID: command.id,
       state: .queued,
@@ -1327,6 +1336,16 @@ final class WatchRelay: NSObject, ObservableObject {
       }
       return command.id
     }
+    let initial = CommandReceipt(commandID: command.id, state: .queued, message: "Guardada en el Watch; pendiente de entrega")
+    guard pendingNewTaskOutbox.record(command, receipt: initial),
+          let saved = try? CodexWatchWire.encode(pendingNewTaskOutbox) else {
+      commandReceipts[command.id] = .init(commandID: command.id, state: .failed, message: "No se pudo guardar la petición. El borrador se conserva.")
+      return command.id
+    }
+    UserDefaults.standard.set(saved, forKey: Self.pendingNewTaskOutboxKey)
+    if !pendingNewTaskOutbox.pendingTransportUpload().contains(where: { $0.command.id == command.id }) {
+      return command.id
+    }
     guard let data = try? CodexWatchWire.encode(command) else {
       commandReceipts[command.id] = CommandReceipt(
         commandID: command.id,
@@ -1337,22 +1356,25 @@ final class WatchRelay: NSObject, ObservableObject {
     }
     if let cloudClient {
       Task { [weak self] in
+        guard let self, !textCommandUploadsInFlight.contains(command.id) else { return }
+        textCommandUploadsInFlight.insert(command.id)
+        pendingCommandRetryAt[command.id] = Date().addingTimeInterval(30)
+        defer { textCommandUploadsInFlight.remove(command.id) }
         do {
           try await cloudClient.createTask(command)
-          self?.commandReceipts[command.id] = CommandReceipt(
+          setTransportAcceptedReceipt(CommandReceipt(
             commandID: command.id,
             state: .queued,
-            message: "Creando directamente por HTTPS…"
-          )
+            message: "Recibida por HTTPS; esperando confirmación del Mac"
+          ))
         } catch {
-          guard let self else { return }
           if Self.isWatchOnlyBuild {
             markCloudOperationFailure("Conexión HTTPS directa no disponible")
-            commandReceipts[command.id] = CommandReceipt(
+            setCommandReceipt(CommandReceipt(
               commandID: command.id,
-              state: .failed,
-              message: "No se pudo crear por la conexión directa"
-            )
+              state: .queued,
+              message: "Guardada en el Watch; se reintentará con la misma orden"
+            ))
             return
           }
           markCloudOperationFailure("HTTPS directo falló · usando iPhone")
@@ -1362,11 +1384,11 @@ final class WatchRelay: NSObject, ObservableObject {
       return command.id
     }
     if Self.isWatchOnlyBuild {
-      commandReceipts[command.id] = CommandReceipt(
+      setCommandReceipt(CommandReceipt(
         commandID: command.id,
-        state: .failed,
-        message: "Conexión directa no disponible"
-      )
+        state: .queued,
+        message: "Guardada en el Watch; esperando conexión directa"
+      ))
       return command.id
     }
     sendNewTaskThroughCompanion(commandID: command.id, data: data)
@@ -1796,6 +1818,7 @@ final class WatchRelay: NSObject, ObservableObject {
   fileprivate func setCommandReceipt(_ receipt: CommandReceipt) {
     commandReceipts[receipt.commandID] = receipt
     pendingTextCommandOutbox.apply(receipt)
+    pendingNewTaskOutbox.apply(receipt)
     if receipt.state != .queued {
       pendingCommandRetryAt.removeValue(forKey: receipt.commandID)
     }
@@ -1805,6 +1828,7 @@ final class WatchRelay: NSObject, ObservableObject {
   private func setTransportAcceptedReceipt(_ receipt: CommandReceipt) {
     commandReceipts[receipt.commandID] = receipt
     pendingTextCommandOutbox.markTransportAccepted(receipt)
+    pendingNewTaskOutbox.apply(receipt, transportAccepted: true)
     pendingCommandRetryAt.removeValue(forKey: receipt.commandID)
     persistPendingTextCommandOutbox()
   }
@@ -1824,6 +1848,9 @@ final class WatchRelay: NSObject, ObservableObject {
   }
 
   private func persistPendingTextCommandOutbox() {
+    if let data = try? CodexWatchWire.encode(pendingNewTaskOutbox) {
+      UserDefaults.standard.set(data, forKey: Self.pendingNewTaskOutboxKey)
+    }
     guard let data = try? CodexWatchWire.encode(pendingTextCommandOutbox) else { return }
     UserDefaults.standard.set(data, forKey: Self.pendingTextCommandOutboxKey)
   }
@@ -1854,6 +1881,27 @@ final class WatchRelay: NSObject, ObservableObject {
         ))
       }
       textCommandUploadsInFlight.remove(intent.command.id)
+    }
+  }
+
+  private func retryPendingNewTasks(using client: WatchCloudRelayClient) async {
+    for intent in pendingNewTaskOutbox.pendingTransportUpload() {
+      let id = intent.command.id
+      if Date().timeIntervalSince(intent.command.createdAt) >= 24 * 60 * 60 {
+        setCommandReceipt(.init(commandID: id, state: .failed, message: "Entrega caducada tras 24 horas; petición conservada para revisión"))
+        continue
+      }
+      if textCommandUploadsInFlight.contains(id) { continue }
+      if let next = pendingCommandRetryAt[id], next > Date() { continue }
+      pendingCommandRetryAt[id] = Date().addingTimeInterval(30)
+      textCommandUploadsInFlight.insert(id)
+      do {
+        try await client.createTask(intent.command)
+        setTransportAcceptedReceipt(.init(commandID: id, state: .queued, message: "Recibida por HTTPS; esperando confirmación del Mac"))
+      } catch {
+        setCommandReceipt(.init(commandID: id, state: .queued, message: "Guardada en el Watch; reintento pendiente"))
+      }
+      textCommandUploadsInFlight.remove(id)
     }
   }
 
@@ -2255,6 +2303,7 @@ final class WatchRelay: NSObject, ObservableObject {
           guard let self else { return }
           for event in events { applyCloudEvent(event) }
           await retryPendingTextCommands(using: client)
+          await retryPendingNewTasks(using: client)
           consecutiveFailures = 0
           if let lastCloudRoundTripAt,
              Date().timeIntervalSince(lastCloudRoundTripAt) <= 90 {

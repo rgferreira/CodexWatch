@@ -1,4 +1,21 @@
 import Foundation
+import CryptoKit
+
+enum CommandContentFingerprint {
+    static func digest(_ text: String) -> String {
+        SHA256.hash(data: Data(text.trimmingCharacters(in: .whitespacesAndNewlines).utf8))
+            .map { String(format: "%02x", $0) }.joined()
+    }
+    static func byteCount(_ text: String) -> Int {
+        text.trimmingCharacters(in: .whitespacesAndNewlines).utf8.count
+    }
+    static func matches(_ text: String, digest: String?, bytes: Int?) -> Bool {
+        // Old builds did not emit fingerprints. Never reinterpret a partial
+        // new fingerprint as an old command.
+        if digest == nil && bytes == nil { return true }
+        return digest == self.digest(text) && bytes == byteCount(text)
+    }
+}
 
 struct CodexTask: Codable, Identifiable, Hashable, Sendable {
     enum State: String, Codable, Sendable {
@@ -89,6 +106,8 @@ struct CodexCommand: Codable, Identifiable, Hashable, Sendable {
     let taskTitle: String
     let text: String
     let createdAt: Date
+    let contentSHA256: String?
+    let contentBytes: Int?
 
     init(task: CodexTask, text: String) {
         id = UUID()
@@ -96,6 +115,8 @@ struct CodexCommand: Codable, Identifiable, Hashable, Sendable {
         taskTitle = task.title
         self.text = text
         createdAt = Date()
+        contentSHA256 = CommandContentFingerprint.digest(text)
+        contentBytes = CommandContentFingerprint.byteCount(text)
     }
 
     init(voiceCommand: CodexVoiceCommand, text: String) {
@@ -104,6 +125,8 @@ struct CodexCommand: Codable, Identifiable, Hashable, Sendable {
         taskTitle = voiceCommand.taskTitle
         self.text = text
         createdAt = voiceCommand.createdAt
+        contentSHA256 = CommandContentFingerprint.digest(text)
+        contentBytes = CommandContentFingerprint.byteCount(text)
     }
 }
 
@@ -113,6 +136,8 @@ struct NewTaskCommand: Codable, Identifiable, Hashable, Sendable {
     let projectID: String?
     let projectPath: String?
     let createdAt: Date
+    let contentSHA256: String?
+    let contentBytes: Int?
 
     init(prompt: String, projectID: String? = nil, projectPath: String?) {
         id = UUID()
@@ -120,6 +145,8 @@ struct NewTaskCommand: Codable, Identifiable, Hashable, Sendable {
         self.projectID = projectID
         self.projectPath = projectPath
         createdAt = Date()
+        contentSHA256 = CommandContentFingerprint.digest(prompt)
+        contentBytes = CommandContentFingerprint.byteCount(prompt)
     }
 }
 
@@ -136,6 +163,41 @@ struct ProjectSelectionState: Equatable, Sendable {
     mutating func select(_ projectID: String) {
         selectedProjectID = projectID
         isInitialized = true
+    }
+}
+
+/// New conversations need the same durable, immutable intent as text commands.
+/// Transport acceptance is not Controller acceptance or task completion.
+struct PendingNewTaskOutbox: Codable, Sendable {
+    struct Intent: Codable, Sendable {
+        let command: NewTaskCommand
+        var receipt: CommandReceipt
+        var transportAcceptedAt: Date?
+    }
+    private(set) var intents: [Intent] = []
+
+    func matching(_ command: NewTaskCommand) -> Intent? {
+        intents.last {
+            $0.command.prompt == command.prompt && $0.command.projectID == command.projectID
+                && $0.command.projectPath == command.projectPath && $0.receipt.state == .queued
+        }
+    }
+    mutating func record(_ command: NewTaskCommand, receipt: CommandReceipt) -> Bool {
+        if let existing = intents.first(where: { $0.command.id == command.id }) {
+            return existing.command == command
+        }
+        guard intents.count < 100 else { return false } // Never evict an unacknowledged intent.
+        intents.append(.init(command: command, receipt: receipt))
+        return true
+    }
+    mutating func apply(_ receipt: CommandReceipt, transportAccepted: Bool = false) {
+        guard let index = intents.firstIndex(where: { $0.command.id == receipt.commandID }) else { return }
+        if receipt.state == .sent { intents.remove(at: index); return }
+        intents[index].receipt = receipt
+        if transportAccepted { intents[index].transportAcceptedAt = Date() }
+    }
+    func pendingTransportUpload() -> [Intent] {
+        intents.filter { $0.receipt.state == .queued && $0.transportAcceptedAt == nil }
     }
 }
 
@@ -249,6 +311,29 @@ struct BridgeOperationSafety: Sendable {
 
     func hasActiveWrite(for threadID: String) -> Bool {
         activeWrites[threadID] != nil
+    }
+
+    /// A transport failure is not a terminal command receipt. Remembering it
+    /// as failed would reject the very next redelivery of the same UUID.
+    mutating func releaseForRetry(commandID: UUID, threadID: String, now: Date = Date()) {
+        if activeWrites[threadID] == commandID {
+            activeWrites.removeValue(forKey: threadID)
+        }
+        var breaker = breakers[threadID] ?? OperationCircuitBreaker()
+        breaker.recordFailure(at: now)
+        breakers[threadID] = breaker
+    }
+}
+
+enum ControllerDeliveryFailurePolicy {
+    static func isRetryable(_ error: Error) -> Bool {
+        if error is CancellationError { return true }
+        if let network = error as? URLError {
+            return [.timedOut, .networkConnectionLost, .cannotConnectToHost,
+                    .cannotFindHost, .notConnectedToInternet, .dnsLookupFailed].contains(network.code)
+        }
+        let text = error.localizedDescription
+        return ["HTTP 502", "HTTP 503", "HTTP 504"].contains { text.contains($0) }
     }
 }
 

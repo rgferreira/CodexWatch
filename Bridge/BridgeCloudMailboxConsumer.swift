@@ -542,7 +542,7 @@ actor BridgeCloudMailboxConsumer {
                     commandID: entry.commandID,
                     state: .sent,
                     message: entry.operationID.hasPrefix("codex-watch:new:")
-                        ? "Tarea completada" : "Orden completada por Relay"
+                        ? "Respuesta de Codex lista; abre la conversación" : "Respuesta de Codex lista; revisa el resultado"
                 ))
                 try await outbox.remove(operationID: entry.operationID)
             case "failed", "cancelled", "handoff_failed":

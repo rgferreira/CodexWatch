@@ -20,8 +20,11 @@ struct CodexControllerClientValidation {
             preconditionFailure("A completed turn must be terminal")
         }
 
+        let pendingCreation = try client.taskCreationResult(from: ["status": "queued"])
+        precondition(pendingCreation.threadID == nil)
+        if case .queued = pendingCreation.disposition {} else { preconditionFailure("Durable queue is not a failure") }
         for invalid in [
-            ["status": "queued"],
+            ["status": "completed"],
             ["status": "unknown", "thread_id": threadID]
         ] {
             do {

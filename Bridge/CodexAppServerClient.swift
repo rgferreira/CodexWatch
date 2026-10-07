@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// Compatibility name retained while CodexWatch migrates to Relay's controller.
 /// This component owns no Codex App Server process, JSON-RPC connection or
@@ -9,7 +10,7 @@ final class CodexAppServerClient: @unchecked Sendable {
         case queued
     }
     struct TaskCreationResult {
-        let threadID: String
+        let threadID: String?
         let disposition: SubmissionDisposition
     }
     private let baseURL = URL(string: "http://127.0.0.1:48721")!
@@ -83,6 +84,10 @@ final class CodexAppServerClient: @unchecked Sendable {
         guard !text.isEmpty, text.count <= 12_000 else {
             throw makeError("La petición debe tener entre 1 y 12.000 caracteres")
         }
+        guard CommandContentFingerprint.matches(text, digest: command.contentSHA256, bytes: command.contentBytes) else {
+            throw makeError("La orden no coincide con el texto confirmado en el Watch; no se enviará")
+        }
+        await recordIntake(operationID: "codex-watch:\(command.id.uuidString)", text: text, originDigest: command.contentSHA256, originBytes: command.contentBytes)
         let result = try await request(
             path: "/v1/turns/submit",
             method: "POST",
@@ -125,6 +130,10 @@ final class CodexAppServerClient: @unchecked Sendable {
         guard !prompt.isEmpty, prompt.count <= 12_000 else {
             throw makeError("La petición debe tener entre 1 y 12.000 caracteres")
         }
+        guard CommandContentFingerprint.matches(prompt, digest: command.contentSHA256, bytes: command.contentBytes) else {
+            throw makeError("La petición no coincide con el texto confirmado en el Watch; no se enviará")
+        }
+        await recordIntake(operationID: "codex-watch:new:\(command.id.uuidString)", text: prompt, originDigest: command.contentSHA256, originBytes: command.contentBytes)
         let projectPath = command.projectPath?.trimmingCharacters(in: .whitespacesAndNewlines)
         let projectID = command.projectID?.trimmingCharacters(in: .whitespacesAndNewlines)
         var payload: [String: Any] = [
@@ -150,14 +159,38 @@ final class CodexAppServerClient: @unchecked Sendable {
     }
 
     func taskCreationResult(from result: [String: Any]) throws -> TaskCreationResult {
-        guard let threadID = result["thread_id"] as? String,
-              !threadID.isEmpty else {
-            throw makeError("Relay no confirmó la nueva tarea")
-        }
+        let threadID = (result["thread_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         switch result["status"] as? String {
-        case "completed": return TaskCreationResult(threadID: threadID, disposition: .completed)
+        case "completed":
+            guard let threadID else { throw makeError("Relay no confirmó la nueva tarea") }
+            return TaskCreationResult(threadID: threadID, disposition: .completed)
         case "queued": return TaskCreationResult(threadID: threadID, disposition: .queued)
         default: throw makeError("Relay devolvió un estado de creación desconocido")
+        }
+    }
+
+    private func recordIntake(operationID: String, text: String, originDigest: String?, originBytes: Int?) async {
+        let bytes = Data(text.utf8)
+        let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        _ = try? await request(path: "/v1/client-telemetry", method: "POST", payload: [
+            "telemetry_id": UUID().uuidString,
+            "operation_id": operationID,
+            "client_id": "codexwatch-bridge",
+            "phase": "bridge_intake",
+            "observed_at": ISO8601DateFormatter().string(from: Date()),
+            "content_sha256": digest,
+            "content_bytes": bytes.count
+        ], timeout: 3)
+        if let originDigest, let originBytes {
+            _ = try? await request(path: "/v1/client-telemetry", method: "POST", payload: [
+                "telemetry_id": UUID().uuidString,
+                "operation_id": operationID,
+                "client_id": "codexwatch-bridge",
+                "phase": "watch_intent_fingerprint",
+                "observed_at": ISO8601DateFormatter().string(from: Date()),
+                "content_sha256": originDigest,
+                "content_bytes": originBytes
+            ], timeout: 3)
         }
     }
 
@@ -194,7 +227,9 @@ final class CodexAppServerClient: @unchecked Sendable {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = timeout
         configuration.timeoutIntervalForResource = timeout
-        let (data, response) = try await URLSession(configuration: configuration).data(for: request)
+        let session = URLSession(configuration: configuration)
+        defer { session.finishTasksAndInvalidate() }
+        let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw makeError("Relay Codex Controller no devolvió HTTP")
         }

@@ -18,10 +18,11 @@ reintentan tras reconectar con su UUID original; una orden ya aceptada no vuelve
 a subirse. Consulta
 [CHANGELOG.md](CHANGELOG.md).
 
-Las últimas builds de desarrollo instaladas son **Watch 49** y **Bridge del Mac
-48** (2026-10-03). Mejoran la sincronización de tareas, pero aún no se han
-promocionado a una nueva versión estable. La firma de desarrollo puede caducar;
-no son una distribución de App Store/TestFlight.
+La build de desarrollo **50** añade entrega durable de nuevas tareas, huellas
+de contenido, reintentos seguros e historial/avisos Telegram en Relay. No está
+promocionada a estable. La build **50** está instalada en el Watch físico; su
+arranque está pendiente porque watchOS indica que está bloqueado. Consulta las [pruebas y límites conocidos](docs/RELIABILITY-2026-10-07.md).
+La firma de desarrollo puede caducar; no es una distribución de App Store/TestFlight.
 
 ## Verlo en acción
 

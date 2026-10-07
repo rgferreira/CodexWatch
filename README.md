@@ -18,10 +18,11 @@ original UUID after reconnection; an accepted command is never uploaded again.
 See
 [CHANGELOG.md](CHANGELOG.md).
 
-The latest installed development builds are **Watch 49** and **Mac Bridge 48**
-(2026-10-03). They improve task-list synchronization but have not been promoted
-to a new stable release. Development signing can expire; these builds are not
-an App Store/TestFlight distribution.
+Development build **50** adds durable new-task delivery, content fingerprints,
+safe retries and Relay-side History/Telegram observability. It is not promoted
+to stable. Build **50** is installed on the physical Watch; its launch check is
+pending because watchOS reports the device locked. See the [validation and known limits](docs/RELIABILITY-2026-10-07.md).
+Development signing can expire; this is not App Store/TestFlight distribution.
 
 ## See it in action
 
@@ -55,7 +56,7 @@ The Watch and Mac Bridge provide two selectable paths:
 
 The Watch and Mac Bridge let you select any of the six supported file-transcription models: `gpt-transcribe`, `gpt-4o-transcribe`, `gpt-4o-mini-transcribe`, `gpt-4o-mini-transcribe-2025-12-15`, `gpt-4o-transcribe-diarize`, and `whisper-1`. The preference is synchronized only inside the approved E2E channel. The API key is configured in Codex Watch Bridge and stored only in the Mac Keychain.
 
-The bridge sends every write to Relay's loopback Controller with an idempotency identifier. Relay is responsible for per-thread ordering, App Server lifecycle, bounded interruption and completion. The Watch reports success only after Relay confirms the final `turn/completed`.
+The bridge sends every write to Relay's loopback Controller with an idempotency identifier. Relay is responsible for per-thread ordering, App Server lifecycle, bounded interruption and completion. A final `turn/completed` means the response is ready, not that an external action succeeded; the response may request information or authorization. Relay History and durable Telegram notices expose failures, stalled operations and available responses.
 
 ## Away from home
 

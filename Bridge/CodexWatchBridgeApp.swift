@@ -197,6 +197,7 @@ final class BridgeController: ObservableObject {
     private var hasLoadedProjects = false
     private var lastSuccessfulCompanionContact: Date?
     private var lastSuccessfulCloudWatchContact: Date?
+    private var presenceExportFailed = false
     private var cloudProvisioning: BridgeCloudRelayProvisioning?
     private var pendingCloudPairing: CloudRelayPairingOffer?
     private var pendingStandaloneOffer: CloudRelayStandaloneBootstrapOffer?
@@ -403,6 +404,7 @@ final class BridgeController: ObservableObject {
     }
 
     private func updateReadiness(preserveStatus: Bool = false) {
+        defer { exportControllerClientPresence() }
         let latestWatchContact = [lastSuccessfulCompanionContact, lastSuccessfulCloudWatchContact]
             .compactMap { $0 }
             .max()
@@ -429,6 +431,40 @@ final class BridgeController: ObservableObject {
             status = "Codex disponible · iniciando el puente…"
         case .unavailable:
             break
+        }
+    }
+
+    // Local read-only contract for Relay. No pairing material, URLs, prompts,
+    // audio, or thread IDs leave the Bridge through this health projection.
+    private func exportControllerClientPresence() {
+        let formatter = ISO8601DateFormatter()
+        var snapshot: [String: Any] = [
+            "schema_version": 1,
+            "pid": ProcessInfo.processInfo.processIdentifier,
+            "generated_at": formatter.string(from: Date()),
+            "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown",
+            "build": Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown",
+            "controller_ready": isCodexReady,
+            "https_configured": cloudTransportConfigured
+        ]
+        if let contact = lastSuccessfulCloudWatchContact {
+            snapshot["watch_last_contact_at"] = formatter.string(from: contact)
+        }
+        if let contact = lastSuccessfulCompanionContact {
+            snapshot["iphone_last_contact_at"] = formatter.string(from: contact)
+        }
+        do {
+            let directory = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support/CodexWatch", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                    attributes: [.posixPermissions: 0o700])
+            let path = directory.appendingPathComponent("controller-client-status.json")
+            try JSONSerialization.data(withJSONObject: snapshot, options: [.sortedKeys]).write(to: path, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
+            presenceExportFailed = false
+        } catch {
+            if !presenceExportFailed { Self.audit("codexwatch_presence_export result=failure") }
+            presenceExportFailed = true
         }
     }
 
@@ -1221,14 +1257,14 @@ final class BridgeController: ObservableObject {
             return outcome
         } catch {
             let text = error.localizedDescription
-            let retryable = error is CancellationError
-                || (error as? URLError)?.code == .timedOut
-                || text.contains("HTTP 503")
-                || text.localizedCaseInsensitiveContains("no disponible")
+            if ControllerDeliveryFailurePolicy.isRetryable(error) {
+                operationSafety.releaseForRetry(commandID: command.id, threadID: command.taskID)
+                return .retryableFailure
+            }
             let receipt = CommandReceipt(commandID: command.id, state: .failed, message: text)
             operationSafety.finishWrite(threadID: command.taskID, receipt: receipt)
             remember(receipt)
-            return retryable ? .retryableFailure : .rejected(text)
+            return .rejected(text)
         }
     }
 
@@ -1289,7 +1325,9 @@ final class BridgeController: ObservableObject {
             case .completed:
                 receipt = CommandReceipt(commandID: command.id, state: .sent, message: "Tarea creada")
             case .queued:
-                receipt = CommandReceipt(commandID: command.id, state: .queued, message: "Tarea creada; Codex está trabajando")
+                receipt = CommandReceipt(commandID: command.id, state: .queued, message: created.threadID == nil
+                    ? "Orden aceptada por Controller; pendiente de crear la tarea"
+                    : "Tarea creada; esperando respuesta de Codex")
             }
             operationSafety.finishWrite(threadID: thread, receipt: receipt)
             remember(receipt)
@@ -1302,6 +1340,10 @@ final class BridgeController: ObservableObject {
             }
             return .completed(receipt.message)
         } catch {
+            if ControllerDeliveryFailurePolicy.isRetryable(error) {
+                operationSafety.releaseForRetry(commandID: command.id, threadID: thread)
+                return .retryableFailure
+            }
             let receipt = CommandReceipt(
                 commandID: command.id,
                 state: .failed,
